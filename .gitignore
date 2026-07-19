@@ -1,0 +1,36 @@
+# Файлы окружения
+.env
+.env.local
+.env.*.local
+
+# База данных и данные сессий
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.session
+*.session-journal
+
+# Логи и временные файлы
+*.log
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.spec
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Docker
+.dockerignore
