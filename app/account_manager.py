@@ -14,16 +14,17 @@ class AccountManager:
         self.accounts = await get_all_accounts_from_db()
 
     async def save(self):
-        pass  # не нужно, так как БД сразу обновляется
+        pass
 
-    async def get_active_accounts(self) -> List[Dict]:
-        return await get_active_accounts_from_db()
+    # Для sender-аккаунтов
+    async def get_active_accounts(self, purpose: str = 'sender') -> List[Dict]:
+        return await get_active_accounts_from_db(purpose)
 
-    async def get_authorized_accounts(self) -> List[Dict]:
-        return await get_authorized_accounts()
+    async def get_authorized_accounts(self, purpose: str = 'sender') -> List[Dict]:
+        return await get_authorized_accounts(purpose)
 
-    async def add_account(self, api_id: int, api_hash: str, phone: str):
-        await add_account_to_db(api_id, api_hash, phone)
+    async def add_account(self, api_id: int, api_hash: str, phone: str, purpose: str = 'sender'):
+        await add_account_to_db(api_id, api_hash, phone, purpose)
         await self.load()
 
     async def mark_authorized(self, phone: str, session_string: str):
@@ -42,11 +43,10 @@ class AccountManager:
         await delete_account_from_db(phone)
         await self.load()
 
-    async def get_next_account(self) -> Optional[Dict]:
-        active = await self.get_active_accounts()
+    async def get_next_account(self, purpose: str = 'sender') -> Optional[Dict]:
+        active = await self.get_active_accounts(purpose)
         if not active:
             return None
-        # циклический перебор
         for i in range(len(active)):
             idx = (self.current_index + i) % len(active)
             acc = active[idx]

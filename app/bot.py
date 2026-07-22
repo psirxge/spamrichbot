@@ -27,7 +27,6 @@ async def main():
     acc_manager = AccountManager()
     await acc_manager.load()
 
-    # Передаём bot в TelethonManager
     manager = TelethonManager(acc_manager, bot)
     # Сохраняем в handlers
     import app.handlers as handlers

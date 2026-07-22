@@ -5,11 +5,9 @@
 
 # База данных и данные сессий
 data/
-*.db
-*.sqlite
-*.sqlite3
-*.session
-*.session-journal
+session
+data.db
+main_session.session
 
 # Логи и временные файлы
 *.log

@@ -1,15 +1,21 @@
 import asyncio
 import logging
 import random
+import os
 from telethon import TelegramClient, events
-from telethon.errors import RPCError, FloodWaitError, SessionPasswordNeededError
+from telethon.errors import (
+    RPCError, FloodWaitError, SessionPasswordNeededError,
+    PhoneCodeExpiredError, PhoneCodeInvalidError, AuthKeyError,
+    PhoneNumberInvalidError, PhoneNumberBannedError, PhoneCodeHashEmptyError
+)
 from telethon.tl.functions.account import UpdateStatusRequest
-from telethon.tl.types import InputPeerUser
-from telethon.sessions import StringSession
+from telethon.sessions import StringSession, SQLiteSession
 from typing import Optional, Dict, Callable, Awaitable
 
-# Вместо этого просто убираем прокси, поэтому импорты не нужны.
-from .db import get_channels_by_type, get_keywords, get_offer_text, get_target_channel
+from .db import (
+    get_channels_by_type, get_keywords, get_offer_text, get_target_channel,
+    get_account, update_account_session, toggle_account_active_db
+)
 from .gemini_utils import generate_rich_html
 from .account_manager import AccountManager
 
@@ -24,17 +30,19 @@ class TelethonManager:
         self.running = False
         self.monitoring_tasks = {}  # phone -> task
         self.lock = asyncio.Lock()
-
-    # Удалён метод _get_proxy_dict — прокси не используется
+        self.last_request_time = {}  # phone -> timestamp
+        self.last_flood_time = {}  # phone -> seconds
 
     async def get_client(self, phone: str, force_new: bool = False) -> Optional[TelegramClient]:
         if phone in self.clients and not force_new:
             return self.clients[phone]
 
-        accounts = await self.account_manager.get_active_accounts()
-        acc = next((a for a in accounts if a['phone'] == phone), None)
+        acc = await get_account(phone)
         if not acc:
-            logger.error(f"Аккаунт {phone} не найден или неактивен")
+            logger.error(f"Аккаунт {phone} не найден в БД")
+            return None
+        if not acc.get('is_active'):
+            logger.error(f"Аккаунт {phone} неактивен")
             return None
 
         session_string = acc.get('session_string')
@@ -43,61 +51,181 @@ class TelethonManager:
                 StringSession(session_string),
                 acc['api_id'],
                 acc['api_hash']
-                # прокси не передаём
             )
             try:
                 await client.connect()
                 if not await client.is_user_authorized():
                     logger.warning(f"Сессия для {phone} недействительна, требуется повторная авторизация")
-                    await self.account_manager.mark_blocked(phone)
+                    await toggle_account_active_db(phone, False)
                     return None
                 await client(UpdateStatusRequest(offline=False))
                 self.clients[phone] = client
                 logger.info(f"Клиент для {phone} восстановлен из сессии")
                 return client
+            except AuthKeyError:
+                logger.warning(f"AuthKeyError для {phone}, сессия невалидна")
+                await toggle_account_active_db(phone, False)
+                return None
             except Exception as e:
                 logger.error(f"Ошибка восстановления сессии для {phone}: {e}")
-                await self.account_manager.mark_blocked(phone)
+                await toggle_account_active_db(phone, False)
                 return None
         else:
             logger.info(f"Для аккаунта {phone} нет сессии, нужно авторизовать")
             return None
 
-    async def authorize_account(self, phone: str, code_callback: Callable[[], Awaitable[str]], 
-                                password_callback: Callable[[], Awaitable[str]] = None) -> bool:
-        accounts = await self.account_manager.get_active_accounts()
-        acc = next((a for a in accounts if a['phone'] == phone), None)
+    async def is_account_authorized(self, phone: str) -> bool:
+        acc = await get_account(phone)
         if not acc:
             return False
+        if not acc.get('session_string'):
+            return False
+        client = await self.get_client(phone)
+        if client:
+            return True
+        return False
 
-        client = TelegramClient(
-            StringSession(),
-            acc['api_id'],
-            acc['api_hash']
-            # без прокси
-        )
+    async def load_session_from_file(self, file_path: str, api_id: int, api_hash: str) -> Optional[Dict]:
+
+        try:
+            session = SQLiteSession(file_path)
+            client = TelegramClient(session, api_id, api_hash)
+            await client.connect()
+            if not await client.is_user_authorized():
+                logger.error(f"Сессия в файле {file_path} невалидна")
+                await client.disconnect()
+                return None
+            me = await client.get_me()
+            phone = me.phone
+            if not phone:
+                logger.error("Не удалось получить номер телефона из сессии")
+                await client.disconnect()
+                return None
+            session_string = client.session.save()
+            await client.disconnect()
+            return {"phone": phone, "session_string": session_string}
+        except Exception as e:
+            logger.error(f"Ошибка загрузки .session файла: {e}")
+            return None
+
+    async def create_client_and_send_code(self, phone: str) -> Optional[TelegramClient]:
+        if phone in self.last_request_time:
+            elapsed = asyncio.get_event_loop().time() - self.last_request_time[phone]
+            if elapsed < 5:
+                logger.warning(f"Слишком частый запрос кода для {phone}, прошло {elapsed:.1f} секунд")
+                return None
+
+        if await self.is_account_authorized(phone):
+            logger.info(f"Аккаунт {phone} уже авторизован, код не отправляем")
+            return await self.get_client(phone)
+
+        acc = await get_account(phone)
+        if not acc or not acc.get('is_active'):
+            logger.error(f"Аккаунт {phone} не найден или неактивен")
+            return None
+
+        client = TelegramClient(StringSession(), acc['api_id'], acc['api_hash'])
         try:
             await client.connect()
-            await client.send_code_request(phone)
-            code = await code_callback()
+            logger.info(f"Клиент для {phone} подключён, отправляем код через Telegram...")
+            result = await client.send_code_request(phone, force_sms=False)
+            logger.info(f"Ответ Telegram: {result}")
+            logger.info(f"Код отправлен на {phone}")
+            self.last_request_time[phone] = asyncio.get_event_loop().time()
+            return client
+        except FloodWaitError as e:
+            wait_seconds = e.seconds
+            hours = wait_seconds // 3600
+            minutes = (wait_seconds % 3600) // 60
+            seconds = wait_seconds % 60
+            logger.error(f"Flood wait {wait_seconds} секунд ({hours}ч {minutes}м {seconds}с) для {phone}")
+            self.last_flood_time[phone] = wait_seconds
+            return None
+        except PhoneNumberInvalidError:
+            logger.error(f"Неверный номер телефона: {phone}")
+            return None
+        except PhoneNumberBannedError:
+            logger.error(f"Номер телефона забанен: {phone}")
+            return None
+        except PhoneCodeHashEmptyError as e:
+            logger.error(f"Ошибка PhoneCodeHashEmpty: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Ошибка отправки кода для {phone}: {e}")
+            return None
+
+    async def refresh_client_and_send_code(self, phone: str) -> Optional[TelegramClient]:
+        if phone in self.clients:
             try:
-                await client.sign_in(phone, code)
-            except SessionPasswordNeededError:
-                if password_callback:
-                    password = await password_callback()
-                    await client.sign_in(password=password)
-                else:
-                    logger.error(f"Для {phone} требуется пароль, но callback не предоставлен")
-                    return False
+                await self.clients[phone].disconnect()
+                logger.info(f"Старый клиент для {phone} отключён")
+            except Exception as e:
+                logger.error(f"Ошибка отключения клиента для {phone}: {e}")
+            del self.clients[phone]
+
+        logger.info(f"Ожидание 5 секунд перед повторной отправкой кода для {phone}")
+        await asyncio.sleep(5)
+
+        if await self.is_account_authorized(phone):
+            logger.info(f"Аккаунт {phone} уже авторизован, код не нужен")
+            return await self.get_client(phone)
+
+        acc = await get_account(phone)
+        if not acc or not acc.get('is_active'):
+            logger.error(f"Аккаунт {phone} не найден или неактивен")
+            return None
+
+        client = TelegramClient(StringSession(), acc['api_id'], acc['api_hash'])
+        try:
+            await client.connect()
+            logger.info(f"Новый клиент для {phone} подключён, отправляем код через Telegram...")
+            result = await client.send_code_request(phone, force_sms=False)
+            logger.info(f"Ответ Telegram: {result}")
+            logger.info(f"Новый код отправлен на {phone}")
+            return client
+        except FloodWaitError as e:
+            wait_seconds = e.seconds
+            hours = wait_seconds // 3600
+            minutes = (wait_seconds % 3600) // 60
+            seconds = wait_seconds % 60
+            logger.error(f"Flood wait {wait_seconds} секунд ({hours}ч {minutes}м {seconds}с) для {phone}")
+            self.last_flood_time[phone] = wait_seconds
+            return None
+        except Exception as e:
+            logger.error(f"Ошибка отправки нового кода для {phone}: {e}")
+            return None
+
+    async def complete_authorization_with_code(self, client: TelegramClient, phone: str, code: str) -> tuple[bool, str]:
+        try:
+            await client.sign_in(phone, code)
             session_string = client.session.save()
-            await self.account_manager.mark_authorized(phone, session_string)
+            await update_account_session(phone, session_string)
             self.clients[phone] = client
-            logger.info(f"Аккаунт {phone} успешно авторизован")
+            logger.info(f"Аккаунт {phone} авторизован с кодом")
+            return True, ""
+        except SessionPasswordNeededError:
+            raise
+        except PhoneCodeExpiredError:
+            return False, "expired"
+        except PhoneCodeInvalidError:
+            return False, "invalid"
+        except Exception as e:
+            logger.error(f"Ошибка входа с кодом для {phone}: {e}")
+            return False, str(e)
+
+    async def complete_authorization_with_password(self, client: TelegramClient, phone: str, password: str) -> bool:
+        try:
+            await client.sign_in(password=password)
+            session_string = client.session.save()
+            await update_account_session(phone, session_string)
+            self.clients[phone] = client
+            logger.info(f"Аккаунт {phone} авторизован с паролем")
             return True
         except Exception as e:
-            logger.error(f"Ошибка авторизации {phone}: {e}")
+            logger.error(f"Ошибка входа с паролем для {phone}: {e}")
             return False
 
+    # ---------- Остальные методы без изменений ----------
     async def send_pm_from_account(self, from_phone: str, user_id: int, text: str) -> bool:
         client = await self.get_client(from_phone)
         if not client:
@@ -109,21 +237,21 @@ class TelethonManager:
             return True
         except FloodWaitError as e:
             logger.warning(f"Flood wait {e.seconds} секунд для {from_phone}")
-            await self.account_manager.mark_blocked(from_phone)
+            await toggle_account_active_db(from_phone, False)
             return False
         except RPCError as e:
             logger.warning(f"Ошибка отправки с {from_phone}: {e}")
             if "BANNED" in str(e) or "CHAT_SEND" in str(e):
-                await self.account_manager.mark_blocked(from_phone)
+                await toggle_account_active_db(from_phone, False)
             return False
         except Exception as e:
             logger.error(f"Неизвестная ошибка с {from_phone}: {e}")
             return False
 
     async def send_pm_with_fallback(self, user_id: int, text: str) -> bool:
-        active = await self.account_manager.get_active_accounts()
+        active = await self.account_manager.get_active_accounts(purpose='sender')
         if not active:
-            logger.error("Нет активных аккаунтов для отправки")
+            logger.error("Нет активных sender-аккаунтов для отправки")
             return False
 
         random.shuffle(active)
@@ -132,17 +260,45 @@ class TelethonManager:
             success = await self.send_pm_from_account(phone, user_id, text)
             if success:
                 return True
-        logger.error("Все аккаунты не смогли отправить сообщение")
+        logger.error("Все sender-аккаунты не смогли отправить сообщение")
         return False
 
-    # ---------- Мониторинг комментариев ----------
+    async def fetch_messages(self, parse_type: str = 'news', limit: int = 5) -> dict:
+        channels = await get_channels_by_type(parse_type)
+        if not channels:
+            return {}
+
+        authorized = await self.account_manager.get_authorized_accounts(purpose='parser')
+        if not authorized:
+            logger.error("Нет авторизованных parser-аккаунтов")
+            return {}
+
+        phone = authorized[0]['phone']
+        client = await self.get_client(phone)
+        if not client:
+            logger.error(f"Не удалось получить клиент для {phone}")
+            return {}
+
+        result = {}
+        for ch in channels:
+            try:
+                messages = []
+                async for msg in client.iter_messages(ch, limit=limit):
+                    if msg.text:
+                        messages.append(msg.text)
+                result[ch] = messages if messages else ["Нет текстовых сообщений"]
+            except Exception as e:
+                logger.error(f"Ошибка парсинга {ch}: {e}")
+                result[ch] = [f"Ошибка: {e}"]
+        return result
+
     async def start_comment_monitoring(self):
         if self.running:
             return
         self.running = True
-        authorized = await self.account_manager.get_authorized_accounts()
+        authorized = await self.account_manager.get_authorized_accounts(purpose='parser')
         if not authorized:
-            logger.warning("Нет авторизованных аккаунтов для мониторинга")
+            logger.warning("Нет авторизованных parser-аккаунтов для мониторинга")
             return
         for acc in authorized:
             phone = acc['phone']
@@ -171,25 +327,24 @@ class TelethonManager:
                 if not sender_id:
                     return
                 offer = await get_offer_text()
-                success = await self.send_pm_from_account(phone, sender_id, offer)
+                success = await self.send_pm_with_fallback(sender_id, offer)
                 if success:
-                    logger.info(f"Предложение отправлено пользователю {sender_id} от {phone}")
+                    logger.info(f"Предложение отправлено пользователю {sender_id}")
                 else:
-                    logger.warning(f"Не удалось отправить от {phone} пользователю {sender_id}")
+                    logger.warning(f"Не удалось отправить предложение пользователю {sender_id}")
 
         logger.info(f"Мониторинг комментариев запущен для {phone}")
         while self.running:
             await asyncio.sleep(1)
         await client.disconnect()
 
-    # ---------- Мониторинг новостей ----------
     async def start_news_monitoring(self):
         if self.running:
             return
         self.running = True
-        authorized = await self.account_manager.get_authorized_accounts()
+        authorized = await self.account_manager.get_authorized_accounts(purpose='parser')
         if not authorized:
-            logger.warning("Нет авторизованных аккаунтов для мониторинга новостей")
+            logger.warning("Нет авторизованных parser-аккаунтов для мониторинга новостей")
             return
         acc = authorized[0]
         task = asyncio.create_task(self._monitor_news(acc['phone']))

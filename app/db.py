@@ -13,18 +13,25 @@ async def init_db():
                 active BOOLEAN DEFAULT 1
             )
         """)
-        # Таблица аккаунтов (с сессиями)
+        # Таблица аккаунтов
         await db.execute("""
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 api_id INTEGER NOT NULL,
                 api_hash TEXT NOT NULL,
                 phone TEXT NOT NULL UNIQUE,
-                session_string TEXT,          -- сериализованная сессия
+                session_string TEXT,
                 is_active BOOLEAN DEFAULT 1,
-                is_authorized BOOLEAN DEFAULT 0
+                is_authorized BOOLEAN DEFAULT 0,
+                purpose TEXT DEFAULT 'sender'
             )
         """)
+        # Добавляем колонку purpose, если её нет
+        try:
+            await db.execute("ALTER TABLE accounts ADD COLUMN purpose TEXT DEFAULT 'sender'")
+        except:
+            pass
+
         # Таблица настроек
         await db.execute("""
             CREATE TABLE IF NOT EXISTS settings (
@@ -44,6 +51,14 @@ async def init_db():
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
             ("offer_text", "Мы предлагаем отличный VPN с персональной скидкой. Промокод: SKIDKA2026. Первые 3 дня – бесплатно! Подробнее в нашем канале @vpn_chanel")
         )
+
+        # Таблица глобальных настроек приложения (для API данных)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
         await db.commit()
 
 # ---------- Channels ----------
@@ -83,33 +98,57 @@ async def toggle_channel_active(chat_id: str, active: bool) -> None:
         )
         await db.commit()
 
-# ---------- Accounts (новые методы) ----------
-async def add_account_to_db(api_id: int, api_hash: str, phone: str) -> None:
+# ---------- Accounts ----------
+async def add_account_to_db(api_id: int, api_hash: str, phone: str, purpose: str = 'sender') -> None:
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute(
-            "INSERT OR REPLACE INTO accounts (api_id, api_hash, phone, is_active, is_authorized) VALUES (?, ?, ?, 1, 0)",
-            (api_id, api_hash, phone)
+            "INSERT OR REPLACE INTO accounts (api_id, api_hash, phone, is_active, is_authorized, purpose) VALUES (?, ?, ?, 1, 0, ?)",
+            (api_id, api_hash, phone, purpose)
         )
         await db.commit()
 
-async def get_all_accounts_from_db() -> List[Dict[str, Any]]:
+async def get_account(phone: str) -> Optional[Dict[str, Any]]:
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM accounts")
+        cursor = await db.execute("SELECT * FROM accounts WHERE phone = ?", (phone,))
+        row = await cursor.fetchone()
+    return dict(row) if row else None
+
+async def get_all_accounts_from_db(purpose: Optional[str] = None) -> List[Dict[str, Any]]:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        if purpose:
+            cursor = await db.execute("SELECT * FROM accounts WHERE purpose = ?", (purpose,))
+        else:
+            cursor = await db.execute("SELECT * FROM accounts")
         rows = await cursor.fetchall()
     return [dict(row) for row in rows]
 
-async def get_active_accounts_from_db() -> List[Dict[str, Any]]:
+async def get_active_accounts_from_db(purpose: Optional[str] = None) -> List[Dict[str, Any]]:
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM accounts WHERE is_active = 1")
+        if purpose:
+            cursor = await db.execute(
+                "SELECT * FROM accounts WHERE is_active = 1 AND purpose = ?",
+                (purpose,)
+            )
+        else:
+            cursor = await db.execute("SELECT * FROM accounts WHERE is_active = 1")
         rows = await cursor.fetchall()
     return [dict(row) for row in rows]
 
-async def get_authorized_accounts() -> List[Dict[str, Any]]:
+async def get_authorized_accounts(purpose: Optional[str] = None) -> List[Dict[str, Any]]:
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM accounts WHERE is_active = 1 AND is_authorized = 1")
+        if purpose:
+            cursor = await db.execute(
+                "SELECT * FROM accounts WHERE is_active = 1 AND is_authorized = 1 AND purpose = ?",
+                (purpose,)
+            )
+        else:
+            cursor = await db.execute(
+                "SELECT * FROM accounts WHERE is_active = 1 AND is_authorized = 1"
+            )
         rows = await cursor.fetchall()
     return [dict(row) for row in rows]
 
@@ -164,3 +203,29 @@ async def get_offer_text() -> str:
 async def get_target_channel() -> str:
     val = await get_setting("target_channel")
     return val or "@your_channel"
+
+# ---------- App Settings (глобальные API данные) ----------
+async def get_app_setting(key: str) -> Optional[str]:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute("SELECT value FROM app_settings WHERE key = ?", (key,))
+        row = await cursor.fetchone()
+    return row[0] if row else None
+
+async def set_app_setting(key: str, value: str) -> None:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)",
+            (key, value)
+        )
+        await db.commit()
+
+async def get_global_api_id() -> Optional[int]:
+    val = await get_app_setting('api_id')
+    return int(val) if val else None
+
+async def get_global_api_hash() -> Optional[str]:
+    return await get_app_setting('api_hash')
+
+async def set_global_api(api_id: int, api_hash: str) -> None:
+    await set_app_setting('api_id', str(api_id))
+    await set_app_setting('api_hash', api_hash)
