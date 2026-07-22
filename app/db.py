@@ -13,7 +13,7 @@ async def init_db():
                 active BOOLEAN DEFAULT 1
             )
         """)
-        # Таблица аккаунтов
+        # Таблица аккаунтов (без purpose, с флагами is_sender/is_parser)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -23,12 +23,17 @@ async def init_db():
                 session_string TEXT,
                 is_active BOOLEAN DEFAULT 1,
                 is_authorized BOOLEAN DEFAULT 0,
-                purpose TEXT DEFAULT 'sender'
+                is_sender BOOLEAN DEFAULT 0,
+                is_parser BOOLEAN DEFAULT 0
             )
         """)
-        # Добавляем колонку purpose, если её нет
+        # Добавляем колонки, если их нет (миграция)
         try:
-            await db.execute("ALTER TABLE accounts ADD COLUMN purpose TEXT DEFAULT 'sender'")
+            await db.execute("ALTER TABLE accounts ADD COLUMN is_sender BOOLEAN DEFAULT 0")
+        except:
+            pass
+        try:
+            await db.execute("ALTER TABLE accounts ADD COLUMN is_parser BOOLEAN DEFAULT 0")
         except:
             pass
 
@@ -52,7 +57,7 @@ async def init_db():
             ("offer_text", "Мы предлагаем отличный VPN с персональной скидкой. Промокод: SKIDKA2026. Первые 3 дня – бесплатно! Подробнее в нашем канале @vpn_chanel")
         )
 
-        # Таблица глобальных настроек приложения (для API данных)
+        # Таблица глобальных настроек приложения (API данные)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS app_settings (
                 key TEXT PRIMARY KEY,
@@ -98,13 +103,24 @@ async def toggle_channel_active(chat_id: str, active: bool) -> None:
         )
         await db.commit()
 
-# ---------- Accounts ----------
-async def add_account_to_db(api_id: int, api_hash: str, phone: str, purpose: str = 'sender') -> None:
+# ---------- Accounts (новые методы с флагами is_sender/is_parser) ----------
+async def add_or_update_account(api_id: int, api_hash: str, phone: str, is_sender: bool = False, is_parser: bool = False) -> None:
+    """Добавляет новый аккаунт или обновляет флаги существующего."""
     async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO accounts (api_id, api_hash, phone, is_active, is_authorized, purpose) VALUES (?, ?, ?, 1, 0, ?)",
-            (api_id, api_hash, phone, purpose)
-        )
+        # Проверяем, существует ли
+        cursor = await db.execute("SELECT id FROM accounts WHERE phone = ?", (phone,))
+        row = await cursor.fetchone()
+        if row:
+            # Обновляем флаги
+            await db.execute(
+                "UPDATE accounts SET api_id = ?, api_hash = ?, is_sender = is_sender OR ?, is_parser = is_parser OR ? WHERE phone = ?",
+                (api_id, api_hash, is_sender, is_parser, phone)
+            )
+        else:
+            await db.execute(
+                "INSERT INTO accounts (api_id, api_hash, phone, is_active, is_authorized, is_sender, is_parser) VALUES (?, ?, ?, 1, 0, ?, ?)",
+                (api_id, api_hash, phone, is_sender, is_parser)
+            )
         await db.commit()
 
 async def get_account(phone: str) -> Optional[Dict[str, Any]]:
@@ -114,41 +130,36 @@ async def get_account(phone: str) -> Optional[Dict[str, Any]]:
         row = await cursor.fetchone()
     return dict(row) if row else None
 
-async def get_all_accounts_from_db(purpose: Optional[str] = None) -> List[Dict[str, Any]]:
+async def get_all_accounts_from_db() -> List[Dict[str, Any]]:
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
-        if purpose:
-            cursor = await db.execute("SELECT * FROM accounts WHERE purpose = ?", (purpose,))
-        else:
-            cursor = await db.execute("SELECT * FROM accounts")
+        cursor = await db.execute("SELECT * FROM accounts")
         rows = await cursor.fetchall()
     return [dict(row) for row in rows]
 
-async def get_active_accounts_from_db(purpose: Optional[str] = None) -> List[Dict[str, Any]]:
+async def get_active_accounts_from_db(role: str = None) -> List[Dict[str, Any]]:
+    """role: 'sender' или 'parser'"""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
-        if purpose:
-            cursor = await db.execute(
-                "SELECT * FROM accounts WHERE is_active = 1 AND purpose = ?",
-                (purpose,)
-            )
+        if role == 'sender':
+            cursor = await db.execute("SELECT * FROM accounts WHERE is_active = 1 AND is_sender = 1")
+        elif role == 'parser':
+            cursor = await db.execute("SELECT * FROM accounts WHERE is_active = 1 AND is_parser = 1")
         else:
             cursor = await db.execute("SELECT * FROM accounts WHERE is_active = 1")
         rows = await cursor.fetchall()
     return [dict(row) for row in rows]
 
-async def get_authorized_accounts(purpose: Optional[str] = None) -> List[Dict[str, Any]]:
+async def get_authorized_accounts(role: str = None) -> List[Dict[str, Any]]:
+    """role: 'sender' или 'parser'"""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
-        if purpose:
-            cursor = await db.execute(
-                "SELECT * FROM accounts WHERE is_active = 1 AND is_authorized = 1 AND purpose = ?",
-                (purpose,)
-            )
+        if role == 'sender':
+            cursor = await db.execute("SELECT * FROM accounts WHERE is_active = 1 AND is_authorized = 1 AND is_sender = 1")
+        elif role == 'parser':
+            cursor = await db.execute("SELECT * FROM accounts WHERE is_active = 1 AND is_authorized = 1 AND is_parser = 1")
         else:
-            cursor = await db.execute(
-                "SELECT * FROM accounts WHERE is_active = 1 AND is_authorized = 1"
-            )
+            cursor = await db.execute("SELECT * FROM accounts WHERE is_active = 1 AND is_authorized = 1")
         rows = await cursor.fetchall()
     return [dict(row) for row in rows]
 
@@ -165,6 +176,16 @@ async def toggle_account_active_db(phone: str, active: bool) -> None:
         await db.execute(
             "UPDATE accounts SET is_active = ? WHERE phone = ?",
             (1 if active else 0, phone)
+        )
+        await db.commit()
+
+async def toggle_account_role(phone: str, role: str, enabled: bool) -> None:
+    """Включает/выключает роль (sender или parser) для аккаунта."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        field = 'is_sender' if role == 'sender' else 'is_parser'
+        await db.execute(
+            f"UPDATE accounts SET {field} = ? WHERE phone = ?",
+            (1 if enabled else 0, phone)
         )
         await db.commit()
 
@@ -204,7 +225,7 @@ async def get_target_channel() -> str:
     val = await get_setting("target_channel")
     return val or "@your_channel"
 
-# ---------- App Settings (глобальные API данные) ----------
+# ---------- App Settings (глобальные API) ----------
 async def get_app_setting(key: str) -> Optional[str]:
     async with aiosqlite.connect(DATABASE_PATH) as db:
         cursor = await db.execute("SELECT value FROM app_settings WHERE key = ?", (key,))

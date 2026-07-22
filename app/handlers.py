@@ -7,7 +7,7 @@ from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from .db import get_global_api_id, get_global_api_hash, set_global_api, get_all_accounts_from_db
+from .db import get_global_api_id, get_global_api_hash, set_global_api, get_all_accounts_from_db, toggle_account_role
 
 from .config import ADMIN_IDS
 from .keyboards import (
@@ -15,7 +15,6 @@ from .keyboards import (
     get_back_button,
     get_channels_menu,
     get_accounts_menu,
-    get_parser_accounts_menu,
     get_parser_comments_menu,
     get_parser_news_menu,
     get_settings_menu,
@@ -30,13 +29,13 @@ from .telethon_client import TelethonManager
 from .account_manager import AccountManager
 from .states import (
     AddAccountState,
-    AddParserAccountState,
     SetSettingState,
     AddChannelState,
     LoadJsonState,
+    GetDiscussionIdState,
 )
 from .gemini_utils import generate_rich_html
-
+from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.errors import SessionPasswordNeededError
 
 router = Router()
@@ -61,18 +60,10 @@ async def cmd_start(message: Message):
 
 # ---------- Главное меню ----------
 @router.message(F.text == "📊 Управление аккаунтами")
-async def manage_accounts(message: Message, state: FSMContext):
+async def manage_accounts(message: Message):
     if not await is_admin(message):
         return
-    await state.update_data(purpose='sender')
-    await message.answer("Управление аккаунтами для рассылки:", reply_markup=get_accounts_menu())
-
-@router.message(F.text == "📡 Парсерные аккаунты")
-async def manage_parser_accounts(message: Message, state: FSMContext):
-    if not await is_admin(message):
-        return
-    await state.update_data(purpose='parser')
-    await message.answer("Управление аккаунтами для парсинга новостей:", reply_markup=get_parser_accounts_menu())
+    await message.answer("Управление аккаунтами:", reply_markup=get_accounts_menu())
 
 @router.message(F.text == "📢 Управление каналами")
 async def manage_channels_reply(message: Message):
@@ -102,7 +93,7 @@ async def parse_news_now(message: Message):
             await message.answer("Нет каналов для парсинга.")
             return
 
-        authorized = await account_manager.get_authorized_accounts(purpose='parser')
+        authorized = await account_manager.get_authorized_accounts(role='parser')
         if not authorized:
             await message.answer("❌ Нет авторизованных parser-аккаунтов.")
             return
@@ -173,11 +164,15 @@ async def parse_comments_now(message: Message):
 
     await message.answer("⏳ Получаю последние комментарии...")
     try:
+        channels = await get_channels_by_type('comment')
+        if not channels:
+            await message.answer("Нет каналов для парсинга комментариев.")
+            return
         result = await telethon_manager.fetch_messages('comments', limit=5)
         if not result:
-            await message.answer("Нет каналов для парсинга комментариев или нет сообщений.")
+            await message.answer("Нет сообщений в каналах комментариев.")
             return
-        output = "💬 Последние комментарии:\n\n"
+        output = "💬 Последние сообщения в каналах комментариев:\n\n"
         for ch, msgs in result.items():
             output += f"📌 Канал: {ch}\n"
             for i, msg in enumerate(msgs, 1):
@@ -190,7 +185,7 @@ async def parse_comments_now(message: Message):
         if output:
             await message.answer(output)
     except Exception as e:
-        logger.error(f"Ошибка парсинга: {e}")
+        logger.error(f"Ошибка: {e}")
         await message.answer(f"❌ Ошибка: {e}")
 
 # ---------- Настройки ----------
@@ -198,14 +193,14 @@ async def parse_comments_now(message: Message):
 async def settings_menu(message: Message):
     if not await is_admin(message):
         return
-    await message.answer("⚙️ Настройки:", reply_markup=get_settings_menu())
+    running = telethon_manager.running if telethon_manager else False
+    await message.answer("⚙️ Настройки:", reply_markup=get_settings_menu(running))
 
-# ---------- Добавление аккаунтов (используем глобальные API) ----------
+# ---------- Добавление аккаунта ----------
 @router.message(F.text == "➕ Добавить аккаунт")
 async def add_account_start(message: Message, state: FSMContext):
     if not await is_admin(message):
         return
-    # Проверяем наличие глобальных API
     api_id = await get_global_api_id()
     api_hash = await get_global_api_hash()
     if not api_id or not api_hash:
@@ -214,39 +209,20 @@ async def add_account_start(message: Message, state: FSMContext):
             "Пожалуйста, сначала загрузите .json файл через кнопку «📁 Загрузить .json»"
         )
         return
-    await state.update_data(api_id=api_id, api_hash=api_hash)
+    await state.update_data(api_id=api_id, api_hash=api_hash, is_sender=True, is_parser=True)
     await message.answer("Введите номер телефона в формате +71234567890:", reply_markup=get_cancel_kb())
     await state.set_state(AddAccountState.waiting_phone)
-
-@router.message(F.text == "➕ Добавить парсер-аккаунт")
-async def add_parser_account_start(message: Message, state: FSMContext):
-    if not await is_admin(message):
-        return
-    api_id = await get_global_api_id()
-    api_hash = await get_global_api_hash()
-    if not api_id or not api_hash:
-        await message.answer(
-            "⚠️ Глобальные API ID и API Hash не заданы.\n"
-            "Пожалуйста, сначала загрузите .json файл через кнопку «📁 Загрузить .json»"
-        )
-        return
-    await state.update_data(api_id=api_id, api_hash=api_hash)
-    await message.answer("Введите номер телефона в формате +71234567890:", reply_markup=get_cancel_kb())
-    await state.set_state(AddParserAccountState.waiting_phone)
 
 # ---------- Загрузка .json ----------
 @router.message(F.text == "📁 Загрузить .json")
 async def load_json_start(message: Message, state: FSMContext):
     if not await is_admin(message):
         return
-    data = await state.get_data()
-    purpose = data.get('purpose', 'sender')
-    await state.update_data(purpose=purpose)
     await state.set_state(LoadJsonState.waiting_file)
     await message.answer(
         "📁 **Загрузка .json файла (TData)**\n\n"
         "Отправьте .json файл, который содержит API ID и API Hash.\n"
-        "Бот извлечёт эти данные и сохранит их для всех будущих добавлений аккаунтов.\n\n"
+        "После загрузки бот сразу запросит номер телефона для добавления аккаунта.\n\n"
         "Файл обычно имеет структуру: {\"app_id\": 12345, \"app_hash\": \"abc...\"}\n"
         "Вы можете скачать такой файл из Telegram Desktop (TData)."
     )
@@ -280,32 +256,15 @@ async def load_json_file(message: Message, state: FSMContext):
             return
 
         await set_global_api(api_id, api_hash)
-
-        purpose = (await state.get_data()).get('purpose', 'sender')
-        
-        # Сохраняем API данные в состояние
-        await state.update_data(api_id=api_id, api_hash=api_hash)
-        
-        # Автоматически переходим к вводу номера телефона
-        if purpose == 'sender':
-            await state.set_state(AddAccountState.waiting_phone)
-            await message.answer(
-                f"✅ API данные успешно загружены:\n"
-                f"📌 API ID: {api_id}\n"
-                f"📌 API Hash: {api_hash}\n\n"
-                "Теперь введите номер телефона в формате +71234567890:",
-                reply_markup=get_cancel_kb()
-            )
-        else:
-            await state.set_state(AddParserAccountState.waiting_phone)
-            await message.answer(
-                f"✅ API данные успешно загружены:\n"
-                f"📌 API ID: {api_id}\n"
-                f"📌 API Hash: {api_hash}\n\n"
-                "Теперь введите номер телефона для парсер-аккаунта в формате +71234567890:",
-                reply_markup=get_cancel_kb()
-            )
-        
+        await state.update_data(api_id=api_id, api_hash=api_hash, is_sender=True, is_parser=True)
+        await message.answer(
+            f"✅ API данные успешно загружены:\n"
+            f"📌 API ID: {api_id}\n"
+            f"📌 API Hash: {api_hash}\n\n"
+            "Теперь введите номер телефона в формате +71234567890:",
+            reply_markup=get_cancel_kb()
+        )
+        await state.set_state(AddAccountState.waiting_phone)
         os.remove(file_path)
     except json.JSONDecodeError:
         await message.answer("❌ Ошибка: файл не является корректным JSON.")
@@ -331,8 +290,14 @@ async def check_auth(message: Message):
     text = "🔍 **Результаты проверки авторизации:**\n\n"
     for acc in accounts:
         phone = acc['phone']
-        purpose = "📤 Sender" if acc['purpose'] == 'sender' else "📡 Parser"
-        if acc.get('session_string'):
+        roles = []
+        if acc.get('is_sender'):
+            roles.append("Sender")
+        if acc.get('is_parser'):
+            roles.append("Parser")
+        role_str = ", ".join(roles) if roles else "Нет ролей"
+
+        if acc.get('session_string') and acc.get('is_authorized'):
             client = await telethon_manager.get_client(phone)
             if client:
                 status = "✅ **Авторизован**"
@@ -340,7 +305,7 @@ async def check_auth(message: Message):
                 status = "❌ **Сессия недействительна** (требуется переавторизация)"
         else:
             status = "⏳ **Ожидает авторизации** (нет сессии)"
-        text += f"• {phone} ({purpose}) – {status}\n"
+        text += f"• {phone} ({role_str}) – {status}\n"
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back_to_main")]
@@ -371,12 +336,106 @@ async def list_channels_reply(message: Message):
     if not channels:
         await message.answer("Нет добавленных каналов.", reply_markup=get_channels_management_kb())
         return
-    text = "📋 Список каналов:\n\n"
+
+    # Получаем клиент для получения linked_chat_id
+    enriched_channels = []
+    client = None
+    if telethon_manager:
+        authorized = await account_manager.get_authorized_accounts(role='parser')
+        if authorized:
+            phone = authorized[0]['phone']
+            client = await telethon_manager.get_client(phone)
+
     for ch in channels:
-        status = "🟢 Активен" if ch['active'] else "🔴 Неактивен"
-        text += f"• {ch['chat_id']} ({ch['type']}) – {status}\n"
+        chat_id = ch['chat_id']
+        ch_type = ch['type']
+        is_active = "🟢 Активен" if ch['active'] else "🔴 Неактивен"
+        linked_id = ""
+        if client:
+            try:
+                entity = await client.get_entity(int(chat_id))
+                full = await client(GetFullChannelRequest(entity))
+                linked = getattr(full, 'linked_chat_id', None)
+                if linked:
+                    linked_id = f" ↔ {linked}"
+            except:
+                pass
+        enriched_channels.append(f"• {chat_id} ({ch_type}) – {is_active}{linked_id}")
+
+    text = "📋 Список каналов:\n\n" + "\n".join(enriched_channels)
     kb = get_channel_delete_buttons(channels)
     await message.answer(text, reply_markup=kb)
+
+# ---------- Получить ID обсуждений ----------
+@router.message(F.text == "🔍 Получить ID обсуждений")
+async def get_discussion_id_start(message: Message, state: FSMContext):
+    if not await is_admin(message):
+        return
+    await state.set_state(GetDiscussionIdState.waiting_chat_id)
+    await message.answer(
+        "Введите ID или username канала (например, @channel или -1001234567890):\n"
+        "Бот покажет ID группы обсуждений, если она есть."
+    )
+
+@router.message(GetDiscussionIdState.waiting_chat_id)
+async def get_discussion_id_chat_id(message: Message, state: FSMContext):
+    if not await is_admin(message):
+        return
+    chat_input = message.text.strip()
+    try:
+        authorized = await account_manager.get_authorized_accounts(role='parser')
+        if not authorized:
+            await message.answer("❌ Нет авторизованных parser-аккаунтов для выполнения запроса.")
+            await state.clear()
+            return
+        phone = authorized[0]['phone']
+        client = await telethon_manager.get_client(phone)
+        if not client:
+            await message.answer("❌ Не удалось получить клиент.")
+            await state.clear()
+            return
+
+        # Пытаемся получить сущность
+        try:
+            entity = await client.get_entity(int(chat_input))
+        except:
+            try:
+                entity = await client.get_entity(chat_input)
+            except Exception as e:
+                await message.answer(f"❌ Не удалось найти канал по указанному ID/username: {e}")
+                await state.clear()
+                return
+
+        full_channel = await client(GetFullChannelRequest(entity))
+        logger.info(f"GetFullChannelRequest response: {full_channel}")
+        linked_id = getattr(full_channel, 'linked_chat_id', None)
+        if linked_id:
+            await message.answer(
+                f"✅ ID чата обсуждений для {chat_input}:\n"
+                f"`{linked_id}`\n\n"
+                f"Вы можете добавить этот ID как канал типа 'comment' в разделе управления каналами."
+            )
+        else:
+            # Ищем среди чатов в full_channel
+            found_chats = []
+            if hasattr(full_channel, 'chats') and full_channel.chats:
+                for chat in full_channel.chats:
+                    if hasattr(chat, 'id') and chat.id != entity.id:
+                        found_chats.append(f"ID: {chat.id}, Название: {chat.title}")
+                if found_chats:
+                    await message.answer(
+                        f"🔍 Найдены связанные чаты:\n" + "\n".join(found_chats) + "\n\n"
+                        f"Возможно, это группа обсуждений. Попробуйте добавить её ID как канал типа 'comment'."
+                    )
+                else:
+                    await message.answer(f"❌ У канала {chat_input} нет чата обсуждений (или он недоступен).")
+            else:
+                await message.answer(f"❌ У канала {chat_input} нет чата обсуждений (или он недоступен).")
+    except Exception as e:
+        logger.error(f"Ошибка получения ID обсуждений: {e}")
+        await message.answer(f"❌ Ошибка: {e}")
+    finally:
+        await state.clear()
 
 # ---------- Отмена ----------
 @router.message(F.text == "❌ Отмена")
@@ -387,7 +446,7 @@ async def cancel_action(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Действие отменено.", reply_markup=get_main_menu())
 
-# ---------- Sender: обработка номера и кода ----------
+# ---------- Общий обработчик номера ----------
 @router.message(AddAccountState.waiting_phone)
 async def add_account_phone(message: Message, state: FSMContext):
     if not await is_admin(message):
@@ -396,22 +455,15 @@ async def add_account_phone(message: Message, state: FSMContext):
     data = await state.get_data()
     api_id = data.get('api_id')
     api_hash = data.get('api_hash')
+    is_sender = data.get('is_sender', True)
+    is_parser = data.get('is_parser', True)
+
     if not api_id or not api_hash:
         await message.answer("❌ Ошибка: API данные не найдены. Загрузите .json файл.")
         await state.clear()
         return
 
-    existing = await get_account(phone)
-    if existing:
-        await message.answer(
-            f"⚠️ Аккаунт с номером {phone} уже существует (цель: {existing['purpose']}).\n"
-            "Если вы хотите изменить цель аккаунта, используйте соответствующий пункт меню.\n"
-            "Пока вы не можете добавить дубликат с тем же номером."
-        )
-        await state.clear()
-        return
-
-    await account_manager.add_account(api_id, api_hash, phone, purpose='sender')
+    await account_manager.add_account(api_id, api_hash, phone, is_sender=is_sender, is_parser=is_parser)
     await state.update_data(phone=phone)
 
     if await telethon_manager.is_account_authorized(phone):
@@ -457,7 +509,7 @@ async def add_account_phone(message: Message, state: FSMContext):
     await state.set_state(AddAccountState.waiting_code)
 
 @router.message(AddAccountState.waiting_code)
-async def process_code_sender(message: Message, state: FSMContext):
+async def process_code(message: Message, state: FSMContext):
     if not await is_admin(message):
         return
     code = message.text.strip()
@@ -504,7 +556,7 @@ async def process_code_sender(message: Message, state: FSMContext):
         await state.update_data(client=client)
 
 @router.message(AddAccountState.waiting_password)
-async def process_password_sender(message: Message, state: FSMContext):
+async def process_password(message: Message, state: FSMContext):
     if not await is_admin(message):
         return
     password = message.text.strip()
@@ -523,137 +575,6 @@ async def process_password_sender(message: Message, state: FSMContext):
     else:
         await message.answer("❌ Неверный пароль. Попробуйте снова или /cancel.")
 
-# ---------- Parser: обработка номера и кода ----------
-@router.message(AddParserAccountState.waiting_phone)
-async def add_parser_phone(message: Message, state: FSMContext):
-    if not await is_admin(message):
-        return
-    phone = message.text.strip()
-    data = await state.get_data()
-    api_id = data.get('api_id')
-    api_hash = data.get('api_hash')
-    if not api_id or not api_hash:
-        await message.answer("❌ Ошибка: API данные не найдены. Загрузите .json файл.")
-        await state.clear()
-        return
-
-    existing = await get_account(phone)
-    if existing:
-        await message.answer(
-            f"⚠️ Аккаунт с номером {phone} уже существует (цель: {existing['purpose']}).\n"
-            "Если вы хотите изменить цель аккаунта, используйте соответствующий пункт меню.\n"
-            "Пока вы не можете добавить дубликат с тем же номером."
-        )
-        await state.clear()
-        return
-
-    await account_manager.add_account(api_id, api_hash, phone, purpose='parser')
-    await state.update_data(phone=phone)
-
-    if await telethon_manager.is_account_authorized(phone):
-        await message.answer(
-            f"✅ Парсер-аккаунт {phone} уже авторизован (найдена валидная сессия).\n"
-            "Используйте его для работы."
-        )
-        await state.clear()
-        return
-
-    client = await telethon_manager.create_client_and_send_code(phone)
-    if not client:
-        flood_time = telethon_manager.last_flood_time.get(phone, 0)
-        if flood_time:
-            hours = flood_time // 3600
-            minutes = (flood_time % 3600) // 60
-            seconds = flood_time % 60
-            await message.answer(
-                f"❌ Telegram заблокировал отправку кодов для этого номера.\n"
-                f"Пожалуйста, подождите: {hours}ч {minutes}м {seconds}с\n"
-                f"или удалите аккаунт и попробуйте позже."
-            )
-        else:
-            await message.answer(
-                "❌ Не удалось отправить код. Проверьте данные аккаунта.\n"
-                "Попробуйте заново добавить парсер-аккаунт."
-            )
-        await state.clear()
-        return
-
-    await state.update_data(client=client)
-    await message.answer(
-        f"✅ Парсер-аккаунт {phone} добавлен. Код подтверждения отправлен в Telegram.\n"
-        "Введите код.\n\n"
-        "⚠️ Если код не приходит, нажмите кнопку 'Запросить новый код'",
-        reply_markup=get_resend_code_kb()
-    )
-    await state.set_state(AddParserAccountState.waiting_code)
-
-@router.message(AddParserAccountState.waiting_code)
-async def process_code_parser(message: Message, state: FSMContext):
-    if not await is_admin(message):
-        return
-    code = message.text.strip()
-    data = await state.get_data()
-    phone = data.get('phone')
-    client = data.get('client')
-
-    if not phone:
-        await message.answer("❌ Ошибка: телефон не найден.")
-        await state.clear()
-        return
-
-    if not client:
-        if await telethon_manager.is_account_authorized(phone):
-            await message.answer("✅ Парсер-аккаунт уже авторизован!", reply_markup=get_parser_accounts_menu())
-            await state.clear()
-            return
-        client = await telethon_manager.create_client_and_send_code(phone)
-        if not client:
-            await message.answer("❌ Не удалось отправить код. Попробуйте заново.")
-            await state.clear()
-            return
-        await state.update_data(client=client)
-
-    try:
-        success, error_type = await telethon_manager.complete_authorization_with_code(client, phone, code)
-        if success:
-            await message.answer("✅ Парсер-аккаунт успешно авторизован!", reply_markup=get_parser_accounts_menu())
-            await state.clear()
-        else:
-            if error_type == "expired":
-                await message.answer(
-                    "⏰ Код истёк. Нажмите кнопку, чтобы запросить новый код.",
-                    reply_markup=get_resend_code_kb()
-                )
-            elif error_type == "invalid":
-                await message.answer("❌ Неверный код. Попробуйте ещё раз:")
-            else:
-                await message.answer(f"❌ Ошибка: {error_type}. Попробуйте заново.")
-                await state.clear()
-    except SessionPasswordNeededError:
-        await message.answer("🔐 Включена двухфакторная аутентификация. Введите пароль:")
-        await state.set_state(AddParserAccountState.waiting_password)
-        await state.update_data(client=client)
-
-@router.message(AddParserAccountState.waiting_password)
-async def process_password_parser(message: Message, state: FSMContext):
-    if not await is_admin(message):
-        return
-    password = message.text.strip()
-    data = await state.get_data()
-    phone = data.get('phone')
-    client = data.get('client')
-    if not phone or not client:
-        await message.answer("❌ Ошибка: данные потеряны. Попробуйте заново.")
-        await state.clear()
-        return
-
-    success = await telethon_manager.complete_authorization_with_password(client, phone, password)
-    if success:
-        await message.answer("✅ Парсер-аккаунт успешно авторизован!", reply_markup=get_parser_accounts_menu())
-        await state.clear()
-    else:
-        await message.answer("❌ Неверный пароль. Попробуйте снова или /cancel.")
-
 # ---------- Обработчик кнопки "Запросить новый код" ----------
 @router.callback_query(F.data == "resend_code")
 async def resend_code_callback(callback: CallbackQuery, state: FSMContext):
@@ -662,7 +583,7 @@ async def resend_code_callback(callback: CallbackQuery, state: FSMContext):
         return
 
     current_state = await state.get_state()
-    if current_state not in [AddAccountState.waiting_code.state, AddParserAccountState.waiting_code.state]:
+    if current_state != AddAccountState.waiting_code.state:
         await callback.answer("Вы не в процессе ввода кода.", show_alert=True)
         return
 
@@ -701,11 +622,10 @@ async def continue_account_authorization(callback: CallbackQuery, state: FSMCont
         return
 
     parts = callback.data.split("_", 3)
-    if len(parts) < 4:
+    if len(parts) < 3:
         await callback.answer("❌ Ошибка в данных", show_alert=True)
         return
-    purpose = parts[2]
-    phone = parts[3]
+    phone = parts[2]
 
     acc = await get_account(phone)
     if not acc:
@@ -715,7 +635,6 @@ async def continue_account_authorization(callback: CallbackQuery, state: FSMCont
         await callback.answer("✅ Аккаунт уже авторизован", show_alert=True)
         return
 
-    # Проверяем, есть ли API данные
     api_id = await get_global_api_id()
     api_hash = await get_global_api_hash()
     if not api_id or not api_hash:
@@ -725,36 +644,20 @@ async def continue_account_authorization(callback: CallbackQuery, state: FSMCont
         return
 
     await state.update_data(phone=phone, api_id=api_id, api_hash=api_hash)
-    if purpose == 'sender':
-        await state.set_state(AddAccountState.waiting_code)
-        client = await telethon_manager.create_client_and_send_code(phone)
-        if not client:
-            await callback.message.edit_text("❌ Не удалось отправить код. Попробуйте позже.")
-            await state.clear()
-            await callback.answer()
-            return
-        await state.update_data(client=client)
-        await callback.message.edit_text(
-            f"🔄 Продолжаем авторизацию для {phone}.\n"
-            "Код подтверждения отправлен в Telegram.\n"
-            "Введите код:",
-            reply_markup=get_resend_code_kb()
-        )
-    else:
-        await state.set_state(AddParserAccountState.waiting_code)
-        client = await telethon_manager.create_client_and_send_code(phone)
-        if not client:
-            await callback.message.edit_text("❌ Не удалось отправить код. Попробуйте позже.")
-            await state.clear()
-            await callback.answer()
-            return
-        await state.update_data(client=client)
-        await callback.message.edit_text(
-            f"🔄 Продолжаем авторизацию парсер-аккаунта {phone}.\n"
-            "Код подтверждения отправлен в Telegram.\n"
-            "Введите код:",
-            reply_markup=get_resend_code_kb()
-        )
+    await state.set_state(AddAccountState.waiting_code)
+    client = await telethon_manager.create_client_and_send_code(phone)
+    if not client:
+        await callback.message.edit_text("❌ Не удалось отправить код. Попробуйте позже.")
+        await state.clear()
+        await callback.answer()
+        return
+    await state.update_data(client=client)
+    await callback.message.edit_text(
+        f"🔄 Продолжаем авторизацию для {phone}.\n"
+        "Код подтверждения отправлен в Telegram.\n"
+        "Введите код:",
+        reply_markup=get_resend_code_kb()
+    )
     await callback.answer()
 
 # ---------- Списки аккаунтов ----------
@@ -762,39 +665,49 @@ async def continue_account_authorization(callback: CallbackQuery, state: FSMCont
 async def list_accounts(message: Message):
     if not await is_admin(message):
         return
-    accounts = await get_all_accounts_from_db(purpose='sender')
+    accounts = await get_all_accounts_from_db()
     if not accounts:
-        await message.answer("Нет добавленных sender-аккаунтов.", reply_markup=get_accounts_menu())
+        await message.answer("Нет добавленных аккаунтов.", reply_markup=get_accounts_menu())
         return
-    text = "👥 Аккаунты для рассылки:\n\n"
-    for acc in accounts:
-        status = "🟢 Активен" if acc['is_active'] else "🔴 Неактивен"
-        auth = "✅ Авторизован" if acc['is_authorized'] else "⏳ Ожидает авторизации"
-        text += f"• {acc['phone']} – {status}, {auth}\n"
-    kb = get_account_delete_buttons(accounts, 'sender')
-    await message.answer(text, reply_markup=kb)
-
-@router.message(F.text == "📋 Список парсер-аккаунтов")
-async def list_parser_accounts(message: Message):
-    if not await is_admin(message):
-        return
-    accounts = await get_all_accounts_from_db(purpose='parser')
-    if not accounts:
-        await message.answer("Нет добавленных парсер-аккаунтов.", reply_markup=get_parser_accounts_menu())
-        return
-    text = "📡 Парсерные аккаунты:\n\n"
-    for acc in accounts:
-        status = "🟢 Активен" if acc['is_active'] else "🔴 Неактивен"
-        auth = "✅ Авторизован" if acc['is_authorized'] else "⏳ Ожидает авторизации"
-        text += f"• {acc['phone']} – {status}, {auth}\n"
-    kb = get_account_delete_buttons(accounts, 'parser')
-    await message.answer(text, reply_markup=kb)
+    kb = get_account_delete_buttons(accounts)
+    await message.answer("👥 Список аккаунтов:", reply_markup=kb)
 
 @router.message(F.text == "🔙 Назад")
 async def back_to_main(message: Message):
     if not await is_admin(message):
         return
     await message.answer("Главное меню:", reply_markup=get_main_menu())
+
+# ---------- Управление ролями (callback) ----------
+@router.callback_query(F.data.startswith("toggle_role_"))
+async def toggle_role_callback(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    parts = callback.data.split("_", 3)
+    if len(parts) < 4:
+        await callback.answer("❌ Ошибка в данных", show_alert=True)
+        return
+    phone = parts[2]
+    role = parts[3]
+
+    acc = await get_account(phone)
+    if not acc:
+        await callback.answer("❌ Аккаунт не найден", show_alert=True)
+        return
+
+    current_value = acc.get(f'is_{role}', 0)
+    new_value = not current_value
+    await toggle_account_role(phone, role, new_value)
+
+    accounts = await get_all_accounts_from_db()
+    kb = get_account_delete_buttons(accounts)
+    await callback.message.edit_text("👥 Список аккаунтов:", reply_markup=kb)
+    await callback.answer(f"✅ Роль {role} {'включена' if new_value else 'выключена'} для {phone}")
+
+@router.callback_query(F.data == "ignore")
+async def ignore_callback(callback: CallbackQuery):
+    await callback.answer()
 
 # ---------- Удаление аккаунтов (callback) ----------
 @router.callback_query(F.data.startswith("delete_acc_"))
@@ -803,37 +716,18 @@ async def delete_account_callback(callback: CallbackQuery):
         await callback.answer("⛔ Доступ запрещён", show_alert=True)
         return
     parts = callback.data.split("_", 3)
-    if len(parts) < 4:
+    if len(parts) < 3:
         await callback.answer("❌ Ошибка в данных", show_alert=True)
         return
-    purpose = parts[2]
-    phone = parts[3]
+    phone = parts[2]
     await delete_account_from_db(phone)
     await callback.answer(f"✅ Аккаунт {phone} удалён.")
-    if purpose == 'sender':
-        accounts = await get_all_accounts_from_db(purpose='sender')
-        if not accounts:
-            await callback.message.edit_text("Нет добавленных sender-аккаунтов.", reply_markup=get_back_button())
-            return
-        text = "👥 Аккаунты для рассылки:\n\n"
-        for acc in accounts:
-            status = "🟢 Активен" if acc['is_active'] else "🔴 Неактивен"
-            auth = "✅ Авторизован" if acc['is_authorized'] else "⏳ Ожидает авторизации"
-            text += f"• {acc['phone']} – {status}, {auth}\n"
-        kb = get_account_delete_buttons(accounts, 'sender')
-        await callback.message.edit_text(text, reply_markup=kb)
-    else:
-        accounts = await get_all_accounts_from_db(purpose='parser')
-        if not accounts:
-            await callback.message.edit_text("Нет добавленных парсер-аккаунтов.", reply_markup=get_back_button())
-            return
-        text = "📡 Парсерные аккаунты:\n\n"
-        for acc in accounts:
-            status = "🟢 Активен" if acc['is_active'] else "🔴 Неактивен"
-            auth = "✅ Авторизован" if acc['is_authorized'] else "⏳ Ожидает авторизации"
-            text += f"• {acc['phone']} – {status}, {auth}\n"
-        kb = get_account_delete_buttons(accounts, 'parser')
-        await callback.message.edit_text(text, reply_markup=kb)
+    accounts = await get_all_accounts_from_db()
+    if not accounts:
+        await callback.message.edit_text("Нет добавленных аккаунтов.", reply_markup=get_accounts_menu())
+        return
+    kb = get_account_delete_buttons(accounts)
+    await callback.message.edit_text("👥 Список аккаунтов:", reply_markup=kb)
 
 # ---------- Удаление каналов (callback) ----------
 @router.callback_query(F.data.startswith("delete_channel_"))
@@ -910,7 +804,7 @@ async def set_setting_value(message: Message, state: FSMContext):
     await message.answer(f"✅ Настройка '{key}' обновлена.")
     await state.clear()
 
-# ---------- Парсеры (вкл/выкл) ----------
+# ---------- Управление мониторингом комментариев (inline) ----------
 @router.callback_query(F.data == "toggle_comment_parser")
 async def toggle_comment_parser(callback: CallbackQuery):
     if callback.from_user.id not in ADMIN_IDS:
@@ -918,12 +812,16 @@ async def toggle_comment_parser(callback: CallbackQuery):
         return
     if telethon_manager.running:
         await telethon_manager.stop_all()
-        await callback.answer("Парсеры остановлены")
+        await callback.answer("⏹ Мониторинг комментариев остановлен")
     else:
+        authorized = await account_manager.get_authorized_accounts(role='parser')
+        if not authorized:
+            await callback.answer("❌ Нет авторизованных parser-аккаунтов. Добавьте аккаунт с ролью parser.", show_alert=True)
+            return
         await telethon_manager.start_comment_monitoring()
-        await callback.answer("Парсер комментариев запущен")
+        await callback.answer("▶️ Мониторинг комментариев запущен")
     running = telethon_manager.running
-    await callback.message.edit_reply_markup(reply_markup=get_parser_comments_menu(running))
+    await callback.message.edit_reply_markup(reply_markup=get_settings_menu(running))
 
 @router.callback_query(F.data == "toggle_news_parser")
 async def toggle_news_parser(callback: CallbackQuery):
@@ -932,12 +830,16 @@ async def toggle_news_parser(callback: CallbackQuery):
         return
     if telethon_manager.running:
         await telethon_manager.stop_all()
-        await callback.answer("Парсеры остановлены")
+        await callback.answer("⏹ Мониторинг новостей остановлен")
     else:
+        authorized = await account_manager.get_authorized_accounts(role='parser')
+        if not authorized:
+            await callback.answer("❌ Нет авторизованных parser-аккаунтов. Добавьте аккаунт с ролью parser.", show_alert=True)
+            return
         await telethon_manager.start_news_monitoring()
-        await callback.answer("Парсер новостей запущен")
+        await callback.answer("▶️ Мониторинг новостей запущен")
     running = telethon_manager.running
-    await callback.message.edit_reply_markup(reply_markup=get_parser_news_menu(running))
+    await callback.message.edit_reply_markup(reply_markup=get_settings_menu(running))
 
 # ---------- Добавление канала ----------
 @router.message(AddChannelState.waiting_chat_id)

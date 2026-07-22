@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import random
-import os
 from telethon import TelegramClient, events
 from telethon.errors import (
     RPCError, FloodWaitError, SessionPasswordNeededError,
@@ -9,12 +8,14 @@ from telethon.errors import (
     PhoneNumberInvalidError, PhoneNumberBannedError, PhoneCodeHashEmptyError
 )
 from telethon.tl.functions.account import UpdateStatusRequest
+from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.sessions import StringSession, SQLiteSession
 from typing import Optional, Dict, Callable, Awaitable
 
 from .db import (
     get_channels_by_type, get_keywords, get_offer_text, get_target_channel,
-    get_account, update_account_session, toggle_account_active_db
+    get_account, update_account_session, toggle_account_active_db,
+    add_channel, get_all_channels
 )
 from .gemini_utils import generate_rich_html
 from .account_manager import AccountManager
@@ -85,8 +86,17 @@ class TelethonManager:
             return True
         return False
 
-    async def load_session_from_file(self, file_path: str, api_id: int, api_hash: str) -> Optional[Dict]:
+    async def get_entity(self, identifier):
+        """Пытается получить сущность через любой доступный клиент."""
+        for phone, client in self.clients.items():
+            try:
+                entity = await client.get_entity(identifier)
+                return entity
+            except:
+                continue
+        return None
 
+    async def load_session_from_file(self, file_path: str, api_id: int, api_hash: str) -> Optional[Dict]:
         try:
             session = SQLiteSession(file_path)
             client = TelegramClient(session, api_id, api_hash)
@@ -225,7 +235,7 @@ class TelethonManager:
             logger.error(f"Ошибка входа с паролем для {phone}: {e}")
             return False
 
-    # ---------- Остальные методы без изменений ----------
+    # ---------- Отправка сообщений ----------
     async def send_pm_from_account(self, from_phone: str, user_id: int, text: str) -> bool:
         client = await self.get_client(from_phone)
         if not client:
@@ -249,7 +259,7 @@ class TelethonManager:
             return False
 
     async def send_pm_with_fallback(self, user_id: int, text: str) -> bool:
-        active = await self.account_manager.get_active_accounts(purpose='sender')
+        active = await self.account_manager.get_active_accounts(role='sender')
         if not active:
             logger.error("Нет активных sender-аккаунтов для отправки")
             return False
@@ -263,12 +273,13 @@ class TelethonManager:
         logger.error("Все sender-аккаунты не смогли отправить сообщение")
         return False
 
+    # ---------- Парсинг по запросу ----------
     async def fetch_messages(self, parse_type: str = 'news', limit: int = 5) -> dict:
         channels = await get_channels_by_type(parse_type)
         if not channels:
             return {}
 
-        authorized = await self.account_manager.get_authorized_accounts(purpose='parser')
+        authorized = await self.account_manager.get_authorized_accounts(role='parser')
         if not authorized:
             logger.error("Нет авторизованных parser-аккаунтов")
             return {}
@@ -292,57 +303,192 @@ class TelethonManager:
                 result[ch] = [f"Ошибка: {e}"]
         return result
 
+    # ---------- Мониторинг комментариев (поллинг) ----------
     async def start_comment_monitoring(self):
         if self.running:
             return
         self.running = True
-        authorized = await self.account_manager.get_authorized_accounts(purpose='parser')
+        authorized = await self.account_manager.get_authorized_accounts(role='parser')
         if not authorized:
             logger.warning("Нет авторизованных parser-аккаунтов для мониторинга")
             return
         for acc in authorized:
             phone = acc['phone']
-            task = asyncio.create_task(self._monitor_comments(phone))
+            task = asyncio.create_task(self._poll_comments(phone))
             self.monitoring_tasks[phone] = task
 
-    async def _monitor_comments(self, phone: str):
+    async def _poll_comments(self, phone: str):
         client = await self.get_client(phone)
         if not client:
             logger.error(f"Не удалось получить клиента для {phone}")
             return
 
-        channels = await get_channels_by_type("comment")
-        if not channels:
+        channels_str = await get_channels_by_type("comment")
+        if not channels_str:
             logger.info(f"Нет каналов для мониторинга комментариев у {phone}")
             return
 
-        @client.on(events.NewMessage(chats=channels))
-        async def handler(event):
-            if not event.message.reply_to:
-                return
-            text = event.message.text or ""
-            keywords = await get_keywords()
-            if any(kw.lower() in text.lower() for kw in keywords):
-                sender_id = event.message.sender_id
-                if not sender_id:
-                    return
-                offer = await get_offer_text()
-                success = await self.send_pm_with_fallback(sender_id, offer)
-                if success:
-                    logger.info(f"Предложение отправлено пользователю {sender_id}")
-                else:
-                    logger.warning(f"Не удалось отправить предложение пользователю {sender_id}")
+        try:
+            await client.get_dialogs()
+            logger.info(f"Диалоги для {phone} загружены")
+        except Exception as e:
+            logger.error(f"Ошибка загрузки диалогов для {phone}: {e}")
 
-        logger.info(f"Мониторинг комментариев запущен для {phone}")
+        channel_entities = []
+        for ch_str in channels_str:
+            try:
+                entity = None
+                try:
+                    entity = await client.get_entity(int(ch_str))
+                except:
+                    try:
+                        entity = await client.get_entity(ch_str)
+                    except:
+                        pass
+
+                if entity:
+                    # Проверяем linked_chat_id
+                    try:
+                        full_channel = await client(GetFullChannelRequest(entity))
+                        logger.info(f"Full channel info: {full_channel}")
+                        linked_id = getattr(full_channel, 'linked_chat_id', None)
+                        if linked_id:
+                            logger.info(f"🔗 Канал {ch_str} имеет чат обсуждений с ID: {linked_id}")
+                            all_channels = await get_all_channels()
+                            exists = any(ch['chat_id'] == str(linked_id) and ch['type'] == 'comment' for ch in all_channels)
+                            if not exists:
+                                await add_channel(str(linked_id), 'comment')
+                                logger.info(f"✅ Автоматически добавлен чат обсуждений {linked_id} как тип 'comment'")
+                                try:
+                                    linked_entity = await client.get_entity(linked_id)
+                                    channel_entities.append(linked_entity)
+                                    logger.info(f"Сущность чата обсуждений {linked_id} добавлена в мониторинг")
+                                except Exception as e:
+                                    logger.error(f"Не удалось получить сущность чата обсуждений {linked_id}: {e}")
+                            else:
+                                logger.info(f"Чат обсуждений {linked_id} уже добавлен в БД")
+                        else:
+                            # Если linked_chat_id нет, ищем среди chats
+                            if hasattr(full_channel, 'chats') and full_channel.chats:
+                                for chat in full_channel.chats:
+                                    if hasattr(chat, 'id') and chat.id != entity.id:
+                                        logger.info(f"Найден связанный чат: ID={chat.id}, название={chat.title}")
+                                        linked_id = chat.id
+                                        all_channels = await get_all_channels()
+                                        exists = any(ch['chat_id'] == str(linked_id) and ch['type'] == 'comment' for ch in all_channels)
+                                        if not exists:
+                                            await add_channel(str(linked_id), 'comment')
+                                            logger.info(f"✅ Автоматически добавлен чат обсуждений {linked_id} как тип 'comment'")
+                                            try:
+                                                linked_entity = await client.get_entity(linked_id)
+                                                channel_entities.append(linked_entity)
+                                                logger.info(f"Сущность чата обсуждений {linked_id} добавлена в мониторинг")
+                                            except Exception as e:
+                                                logger.error(f"Не удалось получить сущность чата обсуждений {linked_id}: {e}")
+                                        else:
+                                            logger.info(f"Чат обсуждений {linked_id} уже добавлен в БД")
+                    except Exception as e:
+                        logger.warning(f"Не удалось получить linked_chat_id для {ch_str}: {e}")
+
+                    channel_entities.append(entity)
+                    logger.info(f"Канал {ch_str} найден")
+                    continue
+
+                # Если сущность не найдена, ищем среди диалогов
+                dialogs = await client.get_dialogs()
+                found = False
+                for d in dialogs:
+                    clean_id = ch_str.lstrip('-')
+                    if str(d.id) == clean_id or d.id == int(clean_id):
+                        channel_entities.append(d.entity)
+                        logger.info(f"Канал {ch_str} найден среди диалогов")
+                        found = True
+                        break
+                if not found:
+                    logger.warning(f"Канал {ch_str} не найден ни одним способом")
+            except Exception as e:
+                logger.warning(f"Канал {ch_str} недоступен: {e}")
+
+        if not channel_entities:
+            logger.info(f"Нет доступных каналов для мониторинга комментариев у {phone}")
+            return
+
+        processed_replies = set()
+        logger.info(f"Мониторинг комментариев (polling) запущен для {phone}, каналов: {len(channel_entities)}")
+
         while self.running:
-            await asyncio.sleep(1)
+            try:
+                for entity in channel_entities:
+                    try:
+                        messages = await client.get_messages(entity, limit=30)
+                        if messages:
+                            logger.info(f"Получено {len(messages)} сообщений из чата {entity}")
+                        channel_id = entity.id if hasattr(entity, 'id') else entity.channel_id
+
+                        for idx, msg in enumerate(messages):
+                            logger.info(f"Все msg {idx}: id={msg.id}, sender={msg.sender_id}, reply_to={msg.reply_to_msg_id}, text='{msg.text[:30] if msg.text else ''}...'")
+
+                        for msg in reversed(messages):
+                            if not msg.text:
+                                continue
+
+                            logger.info(f"Сообщение {msg.id}: sender={msg.sender_id}, reply_to={msg.reply_to_msg_id}, text='{msg.text[:30]}...'")
+
+                            if msg.sender_id == channel_id:
+                                logger.info(f"Сообщение {msg.id} пропущено: отправитель - канал (пост)")
+                                continue
+                            if not msg.reply_to_msg_id:
+                                logger.info(f"Сообщение {msg.id} пропущено: не является ответом (нет reply_to_msg_id)")
+                                continue
+
+                            reply_key = f"{channel_id}_{msg.id}"
+                            if reply_key in processed_replies:
+                                continue
+
+                            try:
+                                me = await client.get_me()
+                                if msg.sender_id == me.id:
+                                    processed_replies.add(reply_key)
+                                    continue
+                            except:
+                                pass
+
+                            text = msg.text or ""
+                            keywords = await get_keywords()
+                            logger.info(f"Проверка комментария {msg.id}: '{text[:30]}...' на ключевые слова {keywords}")
+                            if any(kw.lower() in text.lower() for kw in keywords):
+                                offer = await get_offer_text()
+                                logger.info(f"✅ Найдено ключевое слово в сообщении {msg.id} от {msg.sender_id}")
+                                try:
+                                    await client.send_message(entity, offer, reply_to=msg.id)
+                                    logger.info(f"✅ Ответ отправлен в чате {entity} на сообщение {msg.id}")
+                                    processed_replies.add(reply_key)
+                                except Exception as e:
+                                    logger.error(f"❌ Ошибка отправки ответа в чат: {e}")
+                                    try:
+                                        await client.send_message(msg.sender_id, offer)
+                                        logger.info(f"✅ Ответ отправлен в личку пользователю {msg.sender_id}")
+                                        processed_replies.add(reply_key)
+                                    except Exception as e2:
+                                        logger.error(f"❌ Ошибка отправки в личку: {e2}")
+                            else:
+                                logger.info(f"Ключевые слова не найдены в сообщении {msg.id}")
+                    except Exception as e:
+                        logger.error(f"Ошибка при опросе чата {entity}: {e}")
+
+                await asyncio.sleep(10)
+            except Exception as e:
+                logger.error(f"Ошибка в цикле мониторинга: {e}")
+                await asyncio.sleep(10)
+
         await client.disconnect()
 
+    # ---------- Мониторинг новостей ----------
     async def start_news_monitoring(self):
         if self.running:
             return
         self.running = True
-        authorized = await self.account_manager.get_authorized_accounts(purpose='parser')
+        authorized = await self.account_manager.get_authorized_accounts(role='parser')
         if not authorized:
             logger.warning("Нет авторизованных parser-аккаунтов для мониторинга новостей")
             return
@@ -356,14 +502,32 @@ class TelethonManager:
             logger.error(f"Не удалось получить клиента для новостей ({phone})")
             return
 
+        try:
+            await client.get_dialogs()
+        except Exception as e:
+            logger.error(f"Ошибка загрузки диалогов для новостей: {e}")
+
         sources = await get_channels_by_type("news")
         if not sources:
             logger.info(f"Нет источников новостей для {phone}")
             return
 
+        available_entities = []
+        for ch in sources:
+            try:
+                entity = await client.get_input_entity(ch)
+                available_entities.append(entity)
+                logger.info(f"Источник {ch} доступен для новостей")
+            except Exception as e:
+                logger.warning(f"Источник {ch} недоступен: {e}")
+
+        if not available_entities:
+            logger.info(f"Нет доступных источников новостей для {phone}")
+            return
+
         target = await get_target_channel()
 
-        @client.on(events.NewMessage(chats=sources))
+        @client.on(events.NewMessage(chats=available_entities))
         async def handler(event):
             if not event.message.text:
                 return
@@ -378,9 +542,9 @@ class TelethonManager:
                     await client.send_message(target, html, parse_mode='html')
                     logger.info(f"Опубликована новость в {target} от {phone}")
                 except Exception as e:
-                    logger.error(f"Ошибка публикации: {e}")
+                    logger.error(f"Ошибка публикации в {target}: {e}")
 
-        logger.info(f"Мониторинг новостей запущен для {phone}")
+        logger.info(f"Мониторинг новостей запущен для {phone} (доступно источников: {len(available_entities)})")
         while self.running:
             await asyncio.sleep(1)
         await client.disconnect()

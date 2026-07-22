@@ -1,7 +1,7 @@
 from .db import (
-    add_account_to_db, get_all_accounts_from_db, get_active_accounts_from_db,
+    add_or_update_account, get_all_accounts_from_db, get_active_accounts_from_db,
     get_authorized_accounts, update_account_session, toggle_account_active_db,
-    delete_account_from_db
+    delete_account_from_db, toggle_account_role
 )
 from typing import Dict, List, Optional
 
@@ -16,15 +16,14 @@ class AccountManager:
     async def save(self):
         pass
 
-    # Для sender-аккаунтов
-    async def get_active_accounts(self, purpose: str = 'sender') -> List[Dict]:
-        return await get_active_accounts_from_db(purpose)
+    async def get_active_accounts(self, role: str = None) -> List[Dict]:
+        return await get_active_accounts_from_db(role)
 
-    async def get_authorized_accounts(self, purpose: str = 'sender') -> List[Dict]:
-        return await get_authorized_accounts(purpose)
+    async def get_authorized_accounts(self, role: str = None) -> List[Dict]:
+        return await get_authorized_accounts(role)
 
-    async def add_account(self, api_id: int, api_hash: str, phone: str, purpose: str = 'sender'):
-        await add_account_to_db(api_id, api_hash, phone, purpose)
+    async def add_account(self, api_id: int, api_hash: str, phone: str, is_sender: bool = False, is_parser: bool = False):
+        await add_or_update_account(api_id, api_hash, phone, is_sender, is_parser)
         await self.load()
 
     async def mark_authorized(self, phone: str, session_string: str):
@@ -39,12 +38,16 @@ class AccountManager:
         await toggle_account_active_db(phone, active)
         await self.load()
 
+    async def toggle_role(self, phone: str, role: str, enabled: bool):
+        await toggle_account_role(phone, role, enabled)
+        await self.load()
+
     async def remove_account(self, phone: str):
         await delete_account_from_db(phone)
         await self.load()
 
-    async def get_next_account(self, purpose: str = 'sender') -> Optional[Dict]:
-        active = await self.get_active_accounts(purpose)
+    async def get_next_account(self, role: str = None) -> Optional[Dict]:
+        active = await self.get_active_accounts(role)
         if not active:
             return None
         for i in range(len(active)):

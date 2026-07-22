@@ -5,7 +5,6 @@ from typing import List, Dict
 def get_main_menu() -> ReplyKeyboardMarkup:
     buttons = [
         [KeyboardButton(text="📊 Управление аккаунтами")],
-        [KeyboardButton(text="📡 Парсерные аккаунты")],
         [KeyboardButton(text="📢 Управление каналами")],
         [KeyboardButton(text="📰 Парсер новостей")],
         [KeyboardButton(text="💬 Парсер комментариев")],
@@ -23,20 +22,11 @@ def get_accounts_menu() -> ReplyKeyboardMarkup:
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
 
-def get_parser_accounts_menu() -> ReplyKeyboardMarkup:
-    buttons = [
-        [KeyboardButton(text="➕ Добавить парсер-аккаунт")],
-        [KeyboardButton(text="📁 Загрузить .json")],
-        [KeyboardButton(text="📋 Список парсер-аккаунтов")],
-        [KeyboardButton(text="🔍 Проверить авторизацию")],
-        [KeyboardButton(text="🔙 Назад")]
-    ]
-    return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
-
 def get_channels_management_kb() -> ReplyKeyboardMarkup:
     buttons = [
         [KeyboardButton(text="➕ Добавить канал")],
         [KeyboardButton(text="📋 Список каналов")],
+        [KeyboardButton(text="🔍 Получить ID обсуждений")],
         [KeyboardButton(text="🔙 Назад")]
     ]
     return ReplyKeyboardMarkup(keyboard=buttons, resize_keyboard=True)
@@ -60,29 +50,13 @@ def get_channels_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back")]
     ])
 
-def get_accounts_inline_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить аккаунт", callback_data="add_account")],
-        [InlineKeyboardButton(text="📁 Загрузить .json", callback_data="load_json")],
-        [InlineKeyboardButton(text="📋 Список аккаунтов", callback_data="list_accounts")],
-        [InlineKeyboardButton(text="🔍 Проверить авторизацию", callback_data="check_auth")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="back")]
-    ])
-
-def get_parser_accounts_inline_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить парсер-аккаунт", callback_data="add_parser_account")],
-        [InlineKeyboardButton(text="📁 Загрузить .json", callback_data="load_parser_json")],
-        [InlineKeyboardButton(text="📋 Список парсер-аккаунтов", callback_data="list_parser_accounts")],
-        [InlineKeyboardButton(text="🔍 Проверить авторизацию", callback_data="check_parser_auth")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="back")]
-    ])
-
-def get_settings_menu() -> InlineKeyboardMarkup:
+def get_settings_menu(running: bool = False) -> InlineKeyboardMarkup:
+    comment_status = "⏹ Остановить" if running else "▶️ Запустить"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔑 Ключевые слова", callback_data="set_keywords")],
         [InlineKeyboardButton(text="💬 Текст предложения", callback_data="set_offer")],
         [InlineKeyboardButton(text="📢 Целевой канал", callback_data="set_target")],
+        [InlineKeyboardButton(text=f"💬 {comment_status} мониторинг комментариев", callback_data="toggle_comment_parser")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back")]
     ])
 
@@ -100,18 +74,49 @@ def get_parser_news_menu(running: bool) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back")]
     ])
 
-def get_account_delete_buttons(accounts: List[Dict], purpose: str) -> InlineKeyboardMarkup:
+def get_account_delete_buttons(accounts: List[Dict]) -> InlineKeyboardMarkup:
     keyboard = []
     for acc in accounts:
         phone = acc['phone']
+        is_sender = acc.get('is_sender', 0)
+        is_parser = acc.get('is_parser', 0)
         is_authorized = acc.get('is_authorized', 0)
-        if not is_authorized and not acc.get('session_string'):
-            btn_text = f"▶️ Продолжить {phone}"
-            callback_data = f"continue_acc_{purpose}_{phone}"
-            keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=callback_data)])
-        btn_delete = f"❌ Удалить {phone}"
-        callback_delete = f"delete_acc_{purpose}_{phone}"
-        keyboard.append([InlineKeyboardButton(text=btn_delete, callback_data=callback_delete)])
+        has_session = bool(acc.get('session_string'))
+
+        if is_authorized and has_session:
+            auth_status = "✅ Авторизован"
+        elif has_session and not is_authorized:
+            auth_status = "⚠️ Сессия есть, но не подтверждена"
+        else:
+            auth_status = "❌ Не авторизован"
+
+        roles = []
+        if is_sender:
+            roles.append("📤Sender")
+        if is_parser:
+            roles.append("📡Parser")
+        role_str = ", ".join(roles) if roles else "❌ Нет ролей"
+
+        btn_sender = InlineKeyboardButton(
+            text=f"{'✅' if is_sender else '⬜'} Sender",
+            callback_data=f"toggle_role_{phone}_sender"
+        )
+        btn_parser = InlineKeyboardButton(
+            text=f"{'✅' if is_parser else '⬜'} Parser",
+            callback_data=f"toggle_role_{phone}_parser"
+        )
+        btn_delete = InlineKeyboardButton(
+            text="❌ Удалить",
+            callback_data=f"delete_acc_{phone}"
+        )
+
+        keyboard.append([InlineKeyboardButton(
+            text=f"📱 {phone} | {auth_status} | {role_str}",
+            callback_data="ignore"
+        )])
+        keyboard.append([btn_sender, btn_parser, btn_delete])
+        keyboard.append([InlineKeyboardButton(text="─" * 20, callback_data="ignore")])
+
     keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back")])
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
@@ -119,7 +124,12 @@ def get_channel_delete_buttons(channels: List[Dict]) -> InlineKeyboardMarkup:
     keyboard = []
     for ch in channels:
         chat_id = ch['chat_id']
-        btn_text = f"❌ Удалить {chat_id}"
+        chat_type = ch.get('type', 'unknown')
+        linked_id = ch.get('linked_chat_id', '')
+        label = f"{chat_id} ({chat_type})"
+        if linked_id:
+            label += f" ↔ {linked_id}"
+        btn_text = f"❌ Удалить {label}"
         callback_data = f"delete_channel_{chat_id}"
         keyboard.append([InlineKeyboardButton(text=btn_text, callback_data=callback_data)])
     keyboard.append([InlineKeyboardButton(text="🔙 Назад", callback_data="back")])

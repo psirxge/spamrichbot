@@ -8,6 +8,9 @@ data/
 session
 data.db
 main_session.session
+/data/
+
+*.session
 
 # Логи и временные файлы
 *.log
