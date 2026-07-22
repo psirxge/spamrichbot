@@ -11,11 +11,12 @@ from telethon.tl.functions.account import UpdateStatusRequest
 from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.sessions import StringSession, SQLiteSession
 from typing import Optional, Dict, Callable, Awaitable
+from datetime import datetime
 
 from .db import (
     get_channels_by_type, get_keywords, get_offer_text, get_target_channel,
     get_account, update_account_session, toggle_account_active_db,
-    add_channel, get_all_channels
+    add_channel, get_all_channels, get_monitoring_setting
 )
 from .gemini_utils import generate_rich_html
 from .account_manager import AccountManager
@@ -87,7 +88,6 @@ class TelethonManager:
         return False
 
     async def get_entity(self, identifier):
-        """Пытается получить сущность через любой доступный клиент."""
         for phone, client in self.clients.items():
             try:
                 entity = await client.get_entity(identifier)
@@ -347,7 +347,6 @@ class TelethonManager:
                         pass
 
                 if entity:
-                    # Проверяем linked_chat_id
                     try:
                         full_channel = await client(GetFullChannelRequest(entity))
                         logger.info(f"Full channel info: {full_channel}")
@@ -368,7 +367,6 @@ class TelethonManager:
                             else:
                                 logger.info(f"Чат обсуждений {linked_id} уже добавлен в БД")
                         else:
-                            # Если linked_chat_id нет, ищем среди chats
                             if hasattr(full_channel, 'chats') and full_channel.chats:
                                 for chat in full_channel.chats:
                                     if hasattr(chat, 'id') and chat.id != entity.id:
@@ -394,7 +392,6 @@ class TelethonManager:
                     logger.info(f"Канал {ch_str} найден")
                     continue
 
-                # Если сущность не найдена, ищем среди диалогов
                 dialogs = await client.get_dialogs()
                 found = False
                 for d in dialogs:
@@ -416,6 +413,12 @@ class TelethonManager:
         processed_replies = set()
         logger.info(f"Мониторинг комментариев (polling) запущен для {phone}, каналов: {len(channel_entities)}")
 
+        google_sheets_manager = getattr(self, 'google_sheets_manager', None)
+        if google_sheets_manager:
+            logger.info("✅ Google Sheets менеджер доступен в TelethonManager")
+        else:
+            logger.warning("⚠️ Google Sheets менеджер НЕ доступен в TelethonManager")
+
         while self.running:
             try:
                 for entity in channel_entities:
@@ -425,20 +428,12 @@ class TelethonManager:
                             logger.info(f"Получено {len(messages)} сообщений из чата {entity}")
                         channel_id = entity.id if hasattr(entity, 'id') else entity.channel_id
 
-                        for idx, msg in enumerate(messages):
-                            logger.info(f"Все msg {idx}: id={msg.id}, sender={msg.sender_id}, reply_to={msg.reply_to_msg_id}, text='{msg.text[:30] if msg.text else ''}...'")
-
                         for msg in reversed(messages):
                             if not msg.text:
                                 continue
 
-                            logger.info(f"Сообщение {msg.id}: sender={msg.sender_id}, reply_to={msg.reply_to_msg_id}, text='{msg.text[:30]}...'")
-
+                            # Игнорируем сообщения от самого канала (посты)
                             if msg.sender_id == channel_id:
-                                logger.info(f"Сообщение {msg.id} пропущено: отправитель - канал (пост)")
-                                continue
-                            if not msg.reply_to_msg_id:
-                                logger.info(f"Сообщение {msg.id} пропущено: не является ответом (нет reply_to_msg_id)")
                                 continue
 
                             reply_key = f"{channel_id}_{msg.id}"
@@ -455,24 +450,58 @@ class TelethonManager:
 
                             text = msg.text or ""
                             keywords = await get_keywords()
-                            logger.info(f"Проверка комментария {msg.id}: '{text[:30]}...' на ключевые слова {keywords}")
                             if any(kw.lower() in text.lower() for kw in keywords):
+                                answer_enabled = await get_monitoring_setting("answer_enabled")
+                                collect_enabled = await get_monitoring_setting("collect_enabled")
                                 offer = await get_offer_text()
-                                logger.info(f"✅ Найдено ключевое слово в сообщении {msg.id} от {msg.sender_id}")
-                                try:
-                                    await client.send_message(entity, offer, reply_to=msg.id)
-                                    logger.info(f"✅ Ответ отправлен в чате {entity} на сообщение {msg.id}")
-                                    processed_replies.add(reply_key)
-                                except Exception as e:
-                                    logger.error(f"❌ Ошибка отправки ответа в чат: {e}")
+                                replied = False
+
+                                if answer_enabled:
                                     try:
-                                        await client.send_message(msg.sender_id, offer)
-                                        logger.info(f"✅ Ответ отправлен в личку пользователю {msg.sender_id}")
-                                        processed_replies.add(reply_key)
-                                    except Exception as e2:
-                                        logger.error(f"❌ Ошибка отправки в личку: {e2}")
-                            else:
-                                logger.info(f"Ключевые слова не найдены в сообщении {msg.id}")
+                                        await client.send_message(entity, offer, reply_to=msg.id)
+                                        logger.info(f"✅ Ответ отправлен в чате {entity} на сообщение {msg.id}")
+                                        replied = True
+                                    except Exception as e:
+                                        logger.error(f"❌ Ошибка отправки ответа: {e}")
+                                        try:
+                                            await client.send_message(msg.sender_id, offer)
+                                            logger.info(f"✅ Ответ отправлен в личку пользователю {msg.sender_id}")
+                                            replied = True
+                                        except Exception as e2:
+                                            logger.error(f"❌ Ошибка отправки в личку: {e2}")
+
+                                if collect_enabled and google_sheets_manager:
+                                    try:
+                                        user = await client.get_entity(msg.sender_id)
+                                        username = user.username
+                                        first_name = user.first_name or ''
+                                        last_name = user.last_name or ''
+                                        full_name = f"{first_name} {last_name}".strip()
+                                        display_name = username or full_name or str(msg.sender_id)
+                                        mention = f"@{username}" if username else f"[{full_name}](tg://user?id={msg.sender_id})"
+                                    except:
+                                        username = None
+                                        full_name = str(msg.sender_id)
+                                        display_name = str(msg.sender_id)
+                                        mention = f"tg://user?id={msg.sender_id}"
+
+                                    comment_data = {
+                                        'datetime': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                        'channel': str(entity),
+                                        'user_id': msg.sender_id,
+                                        'username': username or '',
+                                        'display_name': display_name,
+                                        'mention': mention,
+                                        'text': text,
+                                        'replied': replied
+                                    }
+                                    success = await google_sheets_manager.add_comment_record(comment_data)
+                                    if success:
+                                        logger.info("✅ Запись добавлена в Google Sheets")
+                                    else:
+                                        logger.error("❌ Не удалось добавить запись в Google Sheets")
+
+                                processed_replies.add(reply_key)
                     except Exception as e:
                         logger.error(f"Ошибка при опросе чата {entity}: {e}")
 

@@ -7,7 +7,11 @@ from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from .db import get_global_api_id, get_global_api_hash, set_global_api, get_all_accounts_from_db, toggle_account_role
+from .db import (
+    get_global_api_id, get_global_api_hash, set_global_api,
+    get_all_accounts_from_db, toggle_account_role,
+    get_monitoring_setting, set_monitoring_setting, get_setting, set_setting
+)
 
 from .config import ADMIN_IDS
 from .keyboards import (
@@ -15,8 +19,6 @@ from .keyboards import (
     get_back_button,
     get_channels_menu,
     get_accounts_menu,
-    get_parser_comments_menu,
-    get_parser_news_menu,
     get_settings_menu,
     get_cancel_kb,
     get_channels_management_kb,
@@ -33,14 +35,17 @@ from .states import (
     AddChannelState,
     LoadJsonState,
     GetDiscussionIdState,
+    SetGsheetsState,
 )
 from .gemini_utils import generate_rich_html
+from .google_sheets import GoogleSheetsManager
 from telethon.tl.functions.channels import GetFullChannelRequest
 from telethon.errors import SessionPasswordNeededError
 
 router = Router()
 telethon_manager: TelethonManager = None
 account_manager: AccountManager = None
+google_sheets_manager: GoogleSheetsManager = None
 logger = logging.getLogger(__name__)
 
 async def is_admin(message: Message) -> bool:
@@ -194,7 +199,9 @@ async def settings_menu(message: Message):
     if not await is_admin(message):
         return
     running = telethon_manager.running if telethon_manager else False
-    await message.answer("⚙️ Настройки:", reply_markup=get_settings_menu(running))
+    answer_enabled = await get_monitoring_setting("answer_enabled")
+    collect_enabled = await get_monitoring_setting("collect_enabled")
+    await message.answer("⚙️ Настройки:", reply_markup=get_settings_menu(running, answer_enabled, collect_enabled))
 
 # ---------- Добавление аккаунта ----------
 @router.message(F.text == "➕ Добавить аккаунт")
@@ -337,7 +344,6 @@ async def list_channels_reply(message: Message):
         await message.answer("Нет добавленных каналов.", reply_markup=get_channels_management_kb())
         return
 
-    # Получаем клиент для получения linked_chat_id
     enriched_channels = []
     client = None
     if telethon_manager:
@@ -395,7 +401,6 @@ async def get_discussion_id_chat_id(message: Message, state: FSMContext):
             await state.clear()
             return
 
-        # Пытаемся получить сущность
         try:
             entity = await client.get_entity(int(chat_input))
         except:
@@ -416,7 +421,6 @@ async def get_discussion_id_chat_id(message: Message, state: FSMContext):
                 f"Вы можете добавить этот ID как канал типа 'comment' в разделе управления каналами."
             )
         else:
-            # Ищем среди чатов в full_channel
             found_chats = []
             if hasattr(full_channel, 'chats') and full_channel.chats:
                 for chat in full_channel.chats:
@@ -436,6 +440,40 @@ async def get_discussion_id_chat_id(message: Message, state: FSMContext):
         await message.answer(f"❌ Ошибка: {e}")
     finally:
         await state.clear()
+
+# ---------- Настройка Google Sheets ----------
+@router.message(Command("set_gsheets"))
+async def set_gsheets(message: Message, state: FSMContext):
+    if not await is_admin(message):
+        return
+    await state.set_state(SetGsheetsState.waiting_credentials)
+    await message.answer("Отправьте файл credentials.json (ключ сервисного аккаунта Google Sheets).")
+
+@router.message(SetGsheetsState.waiting_credentials, F.document)
+async def set_gsheets_credentials(message: Message, state: FSMContext):
+    if not await is_admin(message):
+        return
+    document = message.document
+    if not document.file_name.endswith('.json'):
+        await message.answer("❌ Пожалуйста, отправьте файл .json")
+        return
+    file_path = f"/tmp/{document.file_name}"
+    await message.bot.download(document, file_path)
+    os.makedirs("data", exist_ok=True)
+    dest_path = "data/credentials.json"
+    os.rename(file_path, dest_path)
+    await state.set_state(SetGsheetsState.waiting_spreadsheet)
+    await message.answer("✅ Файл сохранён. Теперь введите название таблицы Google Sheets (например, 'Comments'):")
+
+@router.message(SetGsheetsState.waiting_spreadsheet)
+async def set_gsheets_spreadsheet(message: Message, state: FSMContext):
+    if not await is_admin(message):
+        return
+    spreadsheet_name = message.text.strip()
+    await set_setting("gsheets_spreadsheet", spreadsheet_name)
+    await message.answer(f"✅ Таблица '{spreadsheet_name}' сохранена. Теперь настройка завершена.\n"
+                         "Перезапустите бота или используйте кнопку «⚙️ Настройки» для активации.")
+    await state.clear()
 
 # ---------- Отмена ----------
 @router.message(F.text == "❌ Отмена")
@@ -804,6 +842,35 @@ async def set_setting_value(message: Message, state: FSMContext):
     await message.answer(f"✅ Настройка '{key}' обновлена.")
     await state.clear()
 
+# ---------- Переключатели ответов/сбора ----------
+@router.callback_query(F.data == "toggle_answer")
+async def toggle_answer(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    current = await get_monitoring_setting("answer_enabled")
+    new_value = not current
+    await set_monitoring_setting("answer_enabled", new_value)
+    await callback.answer(f"📝 Ответы {'включены' if new_value else 'выключены'}")
+    running = telethon_manager.running if telethon_manager else False
+    answer_enabled = await get_monitoring_setting("answer_enabled")
+    collect_enabled = await get_monitoring_setting("collect_enabled")
+    await callback.message.edit_reply_markup(reply_markup=get_settings_menu(running, answer_enabled, collect_enabled))
+
+@router.callback_query(F.data == "toggle_collect")
+async def toggle_collect(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        await callback.answer("⛔ Доступ запрещён", show_alert=True)
+        return
+    current = await get_monitoring_setting("collect_enabled")
+    new_value = not current
+    await set_monitoring_setting("collect_enabled", new_value)
+    await callback.answer(f"📊 Сбор данных {'включён' if new_value else 'выключен'}")
+    running = telethon_manager.running if telethon_manager else False
+    answer_enabled = await get_monitoring_setting("answer_enabled")
+    collect_enabled = await get_monitoring_setting("collect_enabled")
+    await callback.message.edit_reply_markup(reply_markup=get_settings_menu(running, answer_enabled, collect_enabled))
+
 # ---------- Управление мониторингом комментариев (inline) ----------
 @router.callback_query(F.data == "toggle_comment_parser")
 async def toggle_comment_parser(callback: CallbackQuery):
@@ -821,7 +888,9 @@ async def toggle_comment_parser(callback: CallbackQuery):
         await telethon_manager.start_comment_monitoring()
         await callback.answer("▶️ Мониторинг комментариев запущен")
     running = telethon_manager.running
-    await callback.message.edit_reply_markup(reply_markup=get_settings_menu(running))
+    answer_enabled = await get_monitoring_setting("answer_enabled")
+    collect_enabled = await get_monitoring_setting("collect_enabled")
+    await callback.message.edit_reply_markup(reply_markup=get_settings_menu(running, answer_enabled, collect_enabled))
 
 @router.callback_query(F.data == "toggle_news_parser")
 async def toggle_news_parser(callback: CallbackQuery):
@@ -839,7 +908,9 @@ async def toggle_news_parser(callback: CallbackQuery):
         await telethon_manager.start_news_monitoring()
         await callback.answer("▶️ Мониторинг новостей запущен")
     running = telethon_manager.running
-    await callback.message.edit_reply_markup(reply_markup=get_settings_menu(running))
+    answer_enabled = await get_monitoring_setting("answer_enabled")
+    collect_enabled = await get_monitoring_setting("collect_enabled")
+    await callback.message.edit_reply_markup(reply_markup=get_settings_menu(running, answer_enabled, collect_enabled))
 
 # ---------- Добавление канала ----------
 @router.message(AddChannelState.waiting_chat_id)

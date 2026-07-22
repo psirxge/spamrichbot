@@ -50,13 +50,17 @@ def get_channels_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back")]
     ])
 
-def get_settings_menu(running: bool = False) -> InlineKeyboardMarkup:
+def get_settings_menu(running: bool, answer_enabled: bool, collect_enabled: bool) -> InlineKeyboardMarkup:
     comment_status = "⏹ Остановить" if running else "▶️ Запустить"
+    answer_status = "✅ Вкл" if answer_enabled else "❌ Выкл"
+    collect_status = "✅ Вкл" if collect_enabled else "❌ Выкл"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔑 Ключевые слова", callback_data="set_keywords")],
         [InlineKeyboardButton(text="💬 Текст предложения", callback_data="set_offer")],
         [InlineKeyboardButton(text="📢 Целевой канал", callback_data="set_target")],
-        [InlineKeyboardButton(text=f"💬 {comment_status} мониторинг комментариев", callback_data="toggle_comment_parser")],
+        [InlineKeyboardButton(text=f"💬 {comment_status} мониторинг", callback_data="toggle_comment_parser")],
+        [InlineKeyboardButton(text=f"📝 Ответы: {answer_status}", callback_data="toggle_answer")],
+        [InlineKeyboardButton(text=f"📊 Сбор данных: {collect_status}", callback_data="toggle_collect")],
         [InlineKeyboardButton(text="🔙 Назад", callback_data="back")]
     ])
 

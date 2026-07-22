@@ -17,3 +17,7 @@ class LoadJsonState(StatesGroup):
 
 class GetDiscussionIdState(StatesGroup):
     waiting_chat_id = State()
+
+class SetGsheetsState(StatesGroup):
+    waiting_credentials = State()
+    waiting_spreadsheet = State()

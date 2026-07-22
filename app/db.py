@@ -13,7 +13,7 @@ async def init_db():
                 active BOOLEAN DEFAULT 1
             )
         """)
-        # Таблица аккаунтов (без purpose, с флагами is_sender/is_parser)
+        # Таблица аккаунтов
         await db.execute("""
             CREATE TABLE IF NOT EXISTS accounts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -27,7 +27,7 @@ async def init_db():
                 is_parser BOOLEAN DEFAULT 0
             )
         """)
-        # Добавляем колонки, если их нет (миграция)
+        # Добавляем колонки, если их нет
         try:
             await db.execute("ALTER TABLE accounts ADD COLUMN is_sender BOOLEAN DEFAULT 0")
         except:
@@ -37,7 +37,7 @@ async def init_db():
         except:
             pass
 
-        # Таблица настроек
+        # Таблица настроек (для текстовых настроек)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -56,6 +56,10 @@ async def init_db():
             "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
             ("offer_text", "Мы предлагаем отличный VPN с персональной скидкой. Промокод: SKIDKA2026. Первые 3 дня – бесплатно! Подробнее в нашем канале @vpn_chanel")
         )
+        await db.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)",
+            ("gsheets_spreadsheet", "")
+        )
 
         # Таблица глобальных настроек приложения (API данные)
         await db.execute("""
@@ -64,6 +68,22 @@ async def init_db():
                 value TEXT
             )
         """)
+
+        # Таблица настроек мониторинга (флаги)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS monitoring_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT DEFAULT '0'
+            )
+        """)
+        await db.execute(
+            "INSERT OR IGNORE INTO monitoring_settings (key, value) VALUES (?, ?)",
+            ("answer_enabled", "1")
+        )
+        await db.execute(
+            "INSERT OR IGNORE INTO monitoring_settings (key, value) VALUES (?, ?)",
+            ("collect_enabled", "0")
+        )
         await db.commit()
 
 # ---------- Channels ----------
@@ -103,15 +123,12 @@ async def toggle_channel_active(chat_id: str, active: bool) -> None:
         )
         await db.commit()
 
-# ---------- Accounts (новые методы с флагами is_sender/is_parser) ----------
+# ---------- Accounts ----------
 async def add_or_update_account(api_id: int, api_hash: str, phone: str, is_sender: bool = False, is_parser: bool = False) -> None:
-    """Добавляет новый аккаунт или обновляет флаги существующего."""
     async with aiosqlite.connect(DATABASE_PATH) as db:
-        # Проверяем, существует ли
         cursor = await db.execute("SELECT id FROM accounts WHERE phone = ?", (phone,))
         row = await cursor.fetchone()
         if row:
-            # Обновляем флаги
             await db.execute(
                 "UPDATE accounts SET api_id = ?, api_hash = ?, is_sender = is_sender OR ?, is_parser = is_parser OR ? WHERE phone = ?",
                 (api_id, api_hash, is_sender, is_parser, phone)
@@ -138,7 +155,6 @@ async def get_all_accounts_from_db() -> List[Dict[str, Any]]:
     return [dict(row) for row in rows]
 
 async def get_active_accounts_from_db(role: str = None) -> List[Dict[str, Any]]:
-    """role: 'sender' или 'parser'"""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
         if role == 'sender':
@@ -151,7 +167,6 @@ async def get_active_accounts_from_db(role: str = None) -> List[Dict[str, Any]]:
     return [dict(row) for row in rows]
 
 async def get_authorized_accounts(role: str = None) -> List[Dict[str, Any]]:
-    """role: 'sender' или 'parser'"""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
         if role == 'sender':
@@ -180,7 +195,6 @@ async def toggle_account_active_db(phone: str, active: bool) -> None:
         await db.commit()
 
 async def toggle_account_role(phone: str, role: str, enabled: bool) -> None:
-    """Включает/выключает роль (sender или parser) для аккаунта."""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         field = 'is_sender' if role == 'sender' else 'is_parser'
         await db.execute(
@@ -211,9 +225,13 @@ async def set_setting(key: str, value: str) -> None:
 
 async def get_keywords() -> List[str]:
     val = await get_setting("keywords")
-    if not val:
-        return ["впн лагает", "подскажите впн", "какой впн", "впн не работает"]
-    return [kw.strip() for kw in val.split(",") if kw.strip()]
+    base_keywords = ["впн", "vpn"]  # всегда добавляем базовое слово
+    if val:
+        for kw in val.split(","):
+            kw = kw.strip()
+            if kw and kw not in base_keywords:
+                base_keywords.append(kw)
+    return base_keywords
 
 async def get_offer_text() -> str:
     val = await get_setting("offer_text")
@@ -250,3 +268,20 @@ async def get_global_api_hash() -> Optional[str]:
 async def set_global_api(api_id: int, api_hash: str) -> None:
     await set_app_setting('api_id', str(api_id))
     await set_app_setting('api_hash', api_hash)
+
+# ---------- Monitoring Settings (флаги) ----------
+async def get_monitoring_setting(key: str) -> bool:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            "SELECT value FROM monitoring_settings WHERE key = ?", (key,)
+        )
+        row = await cursor.fetchone()
+    return row[0] == '1' if row else False
+
+async def set_monitoring_setting(key: str, value: bool) -> None:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO monitoring_settings (key, value) VALUES (?, ?)",
+            (key, '1' if value else '0')
+        )
+        await db.commit()
